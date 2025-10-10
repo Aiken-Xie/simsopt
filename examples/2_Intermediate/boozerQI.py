@@ -5,7 +5,7 @@ from simsopt.geo import surfaceobjectives_boozer_qi as utils
 from scipy import optimize
 from simsopt import field, geo, objectives
 
-DATA_FOLDER = pathlib.Path("tests/test_files")
+DATA_FOLDER = pathlib.Path("inputs")
 
 # Select the configuration to optimize for.
 # As of now, Boozer surfaces can be fitted only for the preciseQA configuration.
