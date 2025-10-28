@@ -8,6 +8,7 @@ from simsopt._core.optimizable import Optimizable
 from simsopt._core.derivative import derivative_dec, Derivative
 from simsopt.objectives.utilities import forward_backward
 
+__all__ = ['BaseQIField', 'BoozerSurfaceQI']
 
 class BaseQIField():
     def __init__(self, Bmax, Bmin, nfp, iota, Dfunc, sfunc, phi=128, theta=64, neta=72):
@@ -306,7 +307,7 @@ class BaseQIField():
         # add colorbar
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])  # needed for matplotlib < 3.7
-        cbar = fig.colorbar(sm, ax=ax)
+        cbar = plt.gcf().colorbar(sm, ax=ax)
         cbar.set_label('|B| value')
         
         plt.xlabel('Field line label')
@@ -318,103 +319,6 @@ class BaseQIField():
             
 
         
-
-
-class OptimizableQIField(BaseQIField):
-    def __init__(self, nfp, iota, Bmin, Bmax, Dparams, sparams, DN, sL, sN, phi=128, theta=64, neta=72):
-        self._Bmax = Bmax
-        self._Bmin = Bmin
-        self._Dparams = Dparams
-        self._sparams = sparams
-        self.DN, self.sL, self.sN = DN, sL, sN
-
-        self.build_s_and_D_functions()
-
-        super().__init__(self.Bmax, self.Bmin, nfp, iota, self.Dfunc, self.sfunc, phi, theta, neta)
-        self.need_to_update = False
-        
-
-    @property
-    def Dparams(self):
-        return self._Dparams
-    @property
-    def sparams(self):
-        return self._sparams
-    @property
-    def Bmin(self):
-        return self._Bmin
-    @property
-    def Bmax(self):
-        return self._Bmax
-
-    @classmethod
-    def from_boozer_surface(cls, bsurf, DN, sL, sN, neta=72):
-        if bsurf.need_to_run_code:
-            raise ValueError("Need to run boozer surface first")
-
-        bsurf.biotsavart.set_points(bsurf.surface.gamma().reshape((-1,3)))
-        B = bsurf.biotsavart.B()
-        modB = np.linalg.norm(B, axis=1)
-        Bmin = np.min(modB)
-        Bmax = np.max(modB)
-        iota = bsurf.res['iota']
-        nfp = bsurf.surface.nfp
-
-        Dparams = np.zeros((DN,))
-        sparams = np.zeros((sN*(sL+1)))
-        
-        return cls(nfp, iota, Bmin, Bmax, Dparams, sparams, DN, sL, sN,
-            phi=bsurf.surface.quadpoints_phi * 2 * np.pi,
-            theta=bsurf.surface.quadpoints_theta * 2 *np.pi,
-            neta=neta
-        )
-            
-
-    def set_dofs(self, new_values):
-        if new_values.size!=2+self.DN+self.sN*(self.sL+1):
-            raise ValueError("Invalid number of dofs")
-
-        self._Bmax = new_values[0]
-        self._Bmin = new_values[1]
-        self._Dparams = new_values[2:self.DN+2]
-        self._sparams = new_values[self.DN+2:]
-        self.build_s_and_D_functions()    
-
-    def get_concatenated_params(self):
-        return np.concatenate([[self.Bmax, self.Bmin], self.Dparams, self.sparams])
-    
-
-    def build_s_and_D_functions(self):        
-        def x_basis(x,l):
-            return np.sin((l+1./2.)*x) #enforces 0 at origin
-
-        def y_basis(y,n):
-            return np.sin((n+1)*y)
-
-        def Dfunc(x):
-            first_term = np.pi - x
-            second_term = sum([k*np.sin((i+1)*x) for i, k in enumerate(self._Dparams)])
-            return first_term + second_term
-
-        def sfunc(x,y):
-            out = 0
-            for l in range(self.sL+1):
-                for n in range(self.sN):
-                    out += self.get_sln(self.sparams, l, n) * x_basis(x,l) * y_basis(y, n)
-
-            return out
-
-        self.sfunc = sfunc
-        self.Dfunc = Dfunc
-        self.need_to_update = True
-
-    def get_sln(self, sdofs, l, n):
-        return self._sparams[l*self.sN + n]
-        
-    def set_sln(self, sdofs, l, n, mode):
-        sdofs[l*self.sN + n] = mode
-
-            
 
 # ===============================================================================
 
@@ -625,10 +529,6 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
             self: np.einsum('ij,ijl->l' ,dJ_dselfB, self.d_modB_dparams()) #ok
         })
         self._dJ = derivative_wrt_coils + derivative_wrt_local_dofs
-
-        # We are missing the derivatives of self.modB w.r.t the coils dofs; when the coils
-        # dofs change, the boozer angles change, and therefore the eta changes. 
-        # Implicitely, eta depends on the coils dofs.
         
 
     def find_nearest_qi_field(self):

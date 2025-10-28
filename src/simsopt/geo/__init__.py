@@ -13,6 +13,7 @@ from .curveplanarfourier import *
 from .framedcurve import *
 from .finitebuild import *
 from .plotting import *
+from .qi_field_generator import *
 
 from .boozersurface import *
 from .qfmsurface import *
@@ -42,4 +43,4 @@ __all__ = (curve.__all__ + curvehelical.__all__ +
            surfacexyztensorfourier.__all__ + surfaceobjectives.__all__ +
            strain_optimization.__all__ + framedcurve.__all__ +
            wireframe_toroidal.__all__ + ports.__all__ +
-           permanent_magnet_grid.__all__)
+           permanent_magnet_grid.__all__ + qi_field_generator.__all__)
