@@ -344,14 +344,16 @@ def sfunc_pure(x,y,smodes,sL,sN):
 
 
 class BoozerSurfaceQI(BaseQIField, Optimizable):
-    def __init__(self, bsurf, DN, sL, sN, neta=72, definition='goodman'):
+    def __init__(self, bsurf, DN, sL, sN, neta=72, definition='goodman',
+                 nfp_sym=None, regularize_eps=1e-1):
         if bsurf.need_to_run_code:
             raise ValueError("Need to run boozer surface first")
 
         if definition not in ['goodman']:
             raise ValueError("Invalid definition")
         self.definition=definition
-        
+        self._regularize_eps = float(regularize_eps)
+
         self.boozer_surface = bsurf
         bsurf.biotsavart.set_points(bsurf.surface.gamma().reshape((-1,3)))
         B = bsurf.biotsavart.B()
@@ -359,7 +361,7 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         Bmin = np.min(modB)
         Bmax = np.max(modB)
         iota = bsurf.res['iota']
-        nfp = bsurf.surface.nfp
+        nfp = bsurf.surface.nfp if nfp_sym is None else int(nfp_sym)
         
         self.DN, self.sL, self.sN = DN, sL, sN
         #dummy for initialization
@@ -387,12 +389,14 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         x0 = np.zeros((ndofs,)) 
         x0[0] = Bmax
         x0[1] = Bmin
-        
+
         Optimizable.__init__(self, x0=x0, depends_on=[bsurf], names=self.local_dof_names)
-        
+
         self.update()
         self.compute_objective_and_derivative()
 
+    def set_regularize_eps(self, new_eps):
+        self._regularize_eps = float(new_eps)
 
         
     # def ds_x_basis_dx(x,l):
@@ -462,22 +466,20 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         self.need_to_update = True
     
 
-    def J(self):    
+    def J(self):
         return self._J
-
 
     @derivative_dec
     def dJ(self):
         return self._dJ
 
-
     def compute_objective_and_derivative(self):
         self.update()
         nphi = self.boozer_surface.surface.quadpoints_phi.size
         ntheta = self.boozer_surface.surface.quadpoints_theta.size
-        
+
         self.boozer_surface.biotsavart.set_points(
-            self.boozer_surface.surface.gamma().reshape((-1,3)) 
+            self.boozer_surface.surface.gamma().reshape((-1,3))
         )
         B = self.boozer_surface.biotsavart.B().reshape((nphi,ntheta,3))
         modB = np.linalg.norm(B, axis=2)
@@ -526,10 +528,10 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
 
         derivative_wrt_coils = self.boozer_surface.biotsavart.B_vjp(dJdB.reshape((-1,3))) - adj_times_dg_dcoil
         derivative_wrt_local_dofs = Derivative({
-            self: np.einsum('ij,ijl->l' ,dJ_dselfB, self.d_modB_dparams()) #ok
+            self: np.einsum('ij,ijl->l', dJ_dselfB, self.d_modB_dparams()) #ok
         })
         self._dJ = derivative_wrt_coils + derivative_wrt_local_dofs
-        
+
 
     def find_nearest_qi_field(self):
         stats = {'nfev': -1, 'njac': -1}
@@ -545,16 +547,14 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         
             self.set_dofs(dofs)
             residuals = (modB - self.modB).ravel() / np.sqrt(np.mean(modB**2))
-        
-            # print every ~10 evaluations (approximate iteration tracking)
-            #if stats['nfev'] % 10 == 0:
+
             mean_resid = np.mean(residuals**2)
             print(f"nfev = {stats['nfev']:4d} :: mean residual = {mean_resid:.6E}")
         
             return residuals
 
         def jac(dofs):
-            stats['njac'] += 1            
+            stats['njac'] += 1
             
             self.boozer_surface.biotsavart.set_points(self.boozer_surface.surface.gamma().reshape((-1,3)))
             B = self.boozer_surface.biotsavart.B()
@@ -570,8 +570,6 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
             jacobian = -dmodB_dp / np.sqrt(np.mean(modB**2))
 
             return jacobian
-            
-            
         
         x0 = self.get_dofs()
         res = least_squares(func_ls, x0, jac=jac, method='lm')  
@@ -610,20 +608,21 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         # but for now we use an np.einsum
         denom = np.einsum('ijij->ij', self.d_sfunc_dx(sx, sy) + (1.0 + self.d_sfunc_dy(sx, sy) * self._iota_tilde) * self.d_Dfunc_dx(Darg))
 
-        # Again, same inefficient trick for the numerator. These are the derivatives w.r.t the 
+        denom_inv = denom / (denom**2 + self._regularize_eps**2)
+
+        # Again, same inefficient trick for the numerator. These are the derivatives w.r.t the
         # modes of the D function
         a = (1. + self.d_sfunc_dy(sx,sy)*self._iota_tilde)
-        b = self.d_Dfunc_dDparams(Darg) 
-        d_eta_d_Dparams = sgn[:,:,None] * np.einsum('ijij,ijn->ijn',a,b) / denom[:,:,None]
+        b = self.d_Dfunc_dDparams(Darg)
+        d_eta_d_Dparams = sgn[:,:,None] * np.einsum('ijij,ijn->ijn',a,b) * denom_inv[:,:,None]
         grad[:,:,2:2+self.DN] = - self.Bmin * epsilon * np.sin(self._eta_grid[:,:,None]) * d_eta_d_Dparams
 
         # And these are the derivatives w.r.t the modes of the s function
-        d_eta_d_sparams = sgn[:,:,None] * self.d_sfunc_dsparams(sx, sy) / denom[:,:,None]
+        d_eta_d_sparams = sgn[:,:,None] * self.d_sfunc_dsparams(sx, sy) * denom_inv[:,:,None]
         grad[:,:,2+self.DN:]  = - self.Bmin * epsilon * np.sin(self._eta_grid[:,:,None]) * d_eta_d_sparams
-        
+
         return grad
 
-        
         
         
         
