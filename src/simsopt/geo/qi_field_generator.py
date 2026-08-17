@@ -344,14 +344,13 @@ def sfunc_pure(x,y,smodes,sL,sN):
 
 
 class BoozerSurfaceQI(BaseQIField, Optimizable):
-    def __init__(self, bsurf, DN, sL, sN, neta=181, definition='goodman', nfp_sym=None, regularize_eps=1e-1):
+    def __init__(self, bsurf, DN, sL, sN, neta=181, definition='goodman', nfp_sym=None):
         if bsurf.need_to_run_code:
             raise ValueError("Need to run boozer surface first")
 
         if definition not in ['goodman']:
             raise ValueError("Invalid definition")
         self.definition=definition
-        self._regularize_eps = float(regularize_eps)
 
         self.boozer_surface = bsurf
         bsurf.biotsavart.set_points(bsurf.surface.gamma().reshape((-1,3)))
@@ -388,14 +387,18 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         x0 = np.zeros((ndofs,)) 
         x0[0] = Bmax
         x0[1] = Bmin
+        
+        self._last_valid_dJ = None
+        self._last_valid_iota = None
+        self._last_valid_G = None
+        self._last_valid_surface_dofs = None
 
         Optimizable.__init__(self, x0=x0, depends_on=[bsurf], names=self.local_dof_names)
 
         self.update()
         self.compute_objective_and_derivative()
 
-    def set_regularize_eps(self, new_eps):
-        self._regularize_eps = float(new_eps)
+
 
         
     # def ds_x_basis_dx(x,l):
@@ -478,9 +481,46 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
     def dJ(self):
         if self._dJ is None:
             self.compute_objective_and_derivative()
+        if self._dJ is None:
+            return Derivative({})
         return self._dJ
 
     def compute_objective_and_derivative(self):
+        if self.boozer_surface.need_to_run_code:
+            iota = self.boozer_surface.res['iota'] if self._last_valid_iota is None else self._last_valid_iota
+            G = self.boozer_surface.res['G'] if self._last_valid_G is None else self._last_valid_G
+            try:
+                self.boozer_surface.run_code(iota, G)
+            except Exception:
+                if self._last_valid_iota is not None:
+                    self.boozer_surface.res['iota'] = self._last_valid_iota
+                    self.boozer_surface.res['G'] = self._last_valid_G
+                if self._last_valid_surface_dofs is not None:
+                    self.boozer_surface.surface.x = self._last_valid_surface_dofs.copy()
+                self._J = 1e10
+                self._dJ = self._last_valid_dJ
+                return
+        if not self.boozer_surface.res['success']:
+            if self._last_valid_iota is not None:
+                self.boozer_surface.res['iota'] = self._last_valid_iota
+                self.boozer_surface.res['G'] = self._last_valid_G
+            if self._last_valid_surface_dofs is not None:
+                self.boozer_surface.surface.x = self._last_valid_surface_dofs.copy()
+            self._J = 1e10
+            self._dJ = self._last_valid_dJ
+            return
+        new_iota = self.boozer_surface.res['iota']
+        if self._last_valid_iota is not None and abs(new_iota - self._last_valid_iota) > 0.1:
+            self.boozer_surface.res['iota'] = self._last_valid_iota
+            self.boozer_surface.res['G'] = self._last_valid_G
+            if self._last_valid_surface_dofs is not None:
+                self.boozer_surface.surface.x = self._last_valid_surface_dofs.copy()
+            self._J = 1e10
+            self._dJ = self._last_valid_dJ
+            return
+        self._last_valid_iota = new_iota
+        self._last_valid_G = self.boozer_surface.res['G']
+        self._last_valid_surface_dofs = self.boozer_surface.surface.x.copy()
         self.update()
         nphi = self.boozer_surface.surface.quadpoints_phi.size
         ntheta = self.boozer_surface.surface.quadpoints_theta.size
@@ -538,6 +578,7 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
             self: np.einsum('ij,ijl->l', dJ_dselfB, self.d_modB_dparams()) #ok
         })
         self._dJ = derivative_wrt_coils + derivative_wrt_local_dofs
+        self._last_valid_dJ = self._dJ
 
 
     def qi_slopes(self, neta=181):
@@ -642,17 +683,15 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         # but for now we use an np.einsum
         denom = np.einsum('ijij->ij', self.d_sfunc_dx(sx, sy) + (1.0 + self.d_sfunc_dy(sx, sy) * self._iota_tilde) * self.d_Dfunc_dx(Darg))
 
-        denom_inv = denom / (denom**2 + self._regularize_eps**2)
-
         # Again, same inefficient trick for the numerator. These are the derivatives w.r.t the
         # modes of the D function
         a = (1. + self.d_sfunc_dy(sx,sy)*self._iota_tilde)
         b = self.d_Dfunc_dDparams(Darg)
-        d_eta_d_Dparams = sgn[:,:,None] * np.einsum('ijij,ijn->ijn',a,b) * denom_inv[:,:,None]
+        d_eta_d_Dparams = sgn[:,:,None] * np.einsum('ijij,ijn->ijn',a,b) / denom[:,:,None]
         grad[:,:,2:2+self.DN] = - self.Bmin * epsilon * np.sin(self._eta_grid[:,:,None]) * d_eta_d_Dparams
 
         # And these are the derivatives w.r.t the modes of the s function
-        d_eta_d_sparams = sgn[:,:,None] * self.d_sfunc_dsparams(sx, sy) * denom_inv[:,:,None]
+        d_eta_d_sparams = sgn[:,:,None] * self.d_sfunc_dsparams(sx, sy) / denom[:,:,None]
         grad[:,:,2+self.DN:]  = - self.Bmin * epsilon * np.sin(self._eta_grid[:,:,None]) * d_eta_d_sparams
 
         return grad
