@@ -3,7 +3,7 @@ from jax import numpy as jnp
 from jax import grad, vjp, jvp, jacobian
 from jax import jit as jaxjit
 import matplotlib.pyplot as plt
-from scipy.optimize import root, least_squares, root_scalar, minimize
+from scipy.optimize import root, least_squares, root_scalar, minimize, NonlinearConstraint
 from simsopt._core.optimizable import Optimizable
 from simsopt._core.derivative import derivative_dec, Derivative
 from simsopt.objectives.utilities import forward_backward
@@ -11,7 +11,7 @@ from simsopt.objectives.utilities import forward_backward
 __all__ = ['BaseQIField', 'BoozerSurfaceQI']
 
 class BaseQIField():
-    def __init__(self, Bmax, Bmin, nfp, iota, Dfunc, sfunc, phi=128, theta=64, neta=72):
+    def __init__(self, Bmax, Bmin, nfp, iota, Dfunc, sfunc, phi=128, theta=64, neta=181):
         self.nfp = nfp
         self.Dfunc = Dfunc
         self.sfunc = sfunc
@@ -149,7 +149,7 @@ class BaseQIField():
         # Find root
         x0 = eta_guess
         ff = lambda x: root_func(x, theta_tilde, phi_tilde)
-        sol = root(ff, x0, tol=1e-8)
+        sol = root(ff, x0, tol=1e-10)
     
         return sol.x
 
@@ -344,8 +344,7 @@ def sfunc_pure(x,y,smodes,sL,sN):
 
 
 class BoozerSurfaceQI(BaseQIField, Optimizable):
-    def __init__(self, bsurf, DN, sL, sN, neta=72, definition='goodman',
-                 nfp_sym=None, regularize_eps=1e-1):
+    def __init__(self, bsurf, DN, sL, sN, neta=181, definition='goodman', nfp_sym=None, regularize_eps=1e-1):
         if bsurf.need_to_run_code:
             raise ValueError("Need to run boozer surface first")
 
@@ -466,11 +465,19 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         self.need_to_update = True
     
 
+    def recompute_bell(self, parent=None):
+        self._J = None
+        self._dJ = None
+
     def J(self):
+        if self._J is None:
+            self.compute_objective_and_derivative()
         return self._J
 
     @derivative_dec
     def dJ(self):
+        if self._dJ is None:
+            self.compute_objective_and_derivative()
         return self._dJ
 
     def compute_objective_and_derivative(self):
@@ -533,46 +540,73 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         self._dJ = derivative_wrt_coils + derivative_wrt_local_dofs
 
 
-    def find_nearest_qi_field(self):
-        stats = {'nfev': -1, 'njac': -1}
-        
-        def func_ls(dofs):
-            stats['nfev'] += 1
-        
-            self.boozer_surface.biotsavart.set_points(self.boozer_surface.surface.gamma().reshape((-1,3)))
-            B = self.boozer_surface.biotsavart.B()
-            nphi = self.boozer_surface.surface.quadpoints_phi.size
-            ntheta = self.boozer_surface.surface.quadpoints_theta.size
-            modB = np.linalg.norm(B, axis=1).reshape((nphi, ntheta))
-        
+    def qi_slopes(self, neta=181):
+        r"""d(zeta_tilde)/d(eta) on a fixed grid.
+        Must be > 0 for mapping to be single-valued/invertible.
+        """
+        eta = np.linspace(0, 2 * np.pi, neta)
+        deta = eta[1] - eta[0]
+        return np.concatenate([
+            np.diff(np.asarray(self.phi_tilde_from_eta(eta, np.full_like(eta, tt)))) / deta
+            for tt in np.unique(self._theta_tilde_grid)
+        ])
+
+
+    def find_nearest_qi_field(self, slope_lb=1e-2):
+        self.boozer_surface.biotsavart.set_points(
+            self.boozer_surface.surface.gamma().reshape((-1, 3)))
+        B = self.boozer_surface.biotsavart.B()
+        nphi = self.boozer_surface.surface.quadpoints_phi.size
+        ntheta = self.boozer_surface.surface.quadpoints_theta.size
+        modB = np.linalg.norm(B, axis=1).reshape((nphi, ntheta))
+        rms = np.sqrt(np.mean(modB**2))
+
+        cache = {"x": None, "r": None, "J": None}
+        stats = {"nfev": 0}
+
+        def _resid(dofs):
+            if cache["x"] is None or not np.array_equal(dofs, cache["x"]):
+                stats["nfev"] += 1
+                self.set_dofs(dofs)
+                cache["x"] = np.asarray(dofs).copy()
+                cache["r"] = (modB - self.modB).ravel() / rms
+                cache["J"] = None
+                print(f"nfev = {stats['nfev']:4d} :: mean residual = "
+                      f"{np.mean(cache['r']**2):.6E}")
+            return cache["r"]
+
+        def _jac(dofs):
+            _resid(dofs)
+            if cache["J"] is None:
+                cache["J"] = -self.d_modB_dparams().reshape((-1, np.size(dofs))) / rms
+            return cache["J"]
+
+        def cost(dofs):
+            r = _resid(dofs)
+            return 0.5 * float(r @ r)
+
+        def cost_grad(dofs):
+            return _jac(dofs).T @ _resid(dofs)
+
+        def slopes(dofs):
             self.set_dofs(dofs)
-            residuals = (modB - self.modB).ravel() / np.sqrt(np.mean(modB**2))
+            return self.qi_slopes()
 
-            mean_resid = np.mean(residuals**2)
-            print(f"nfev = {stats['nfev']:4d} :: mean residual = {mean_resid:.6E}")
-        
-            return residuals
-
-        def jac(dofs):
-            stats['njac'] += 1
-            
-            self.boozer_surface.biotsavart.set_points(self.boozer_surface.surface.gamma().reshape((-1,3)))
-            B = self.boozer_surface.biotsavart.B()
-            nphi = self.boozer_surface.surface.quadpoints_phi.size
-            ntheta = self.boozer_surface.surface.quadpoints_theta.size
-            modB = np.linalg.norm(B, axis=1).reshape((nphi, ntheta))
-
-            
-            self.set_dofs(dofs)
-            ndofs = dofs.size
-            dmodB_dp = self.d_modB_dparams().reshape((-1, ndofs))
-            
-            jacobian = -dmodB_dp / np.sqrt(np.mean(modB**2))
-
-            return jacobian
-        
         x0 = self.get_dofs()
-        res = least_squares(func_ls, x0, jac=jac, method='lm')  
+        if slopes(x0).min() <= slope_lb:
+            ok = lambda a: slopes(np.r_[x0[:2], a * x0[2:]]).min() > slope_lb
+            lo, hi = 0.0, 1.0
+            for _ in range(40):
+                m = 0.5 * (lo + hi)
+                lo, hi = (m, hi) if ok(m) else (lo, m)
+            x0 = np.r_[x0[:2], lo * x0[2:]]
+
+        res = minimize(cost, x0, jac=cost_grad, method='SLSQP',
+                       constraints=[NonlinearConstraint(slopes, slope_lb, np.inf)],
+                       options=dict(maxiter=300, ftol=1e-12))
+        self.set_dofs(res.x)
+        print(f"find_nearest_qi_field: nfev={stats['nfev']} "
+              f"min_slope={slopes(res.x).min():+.4e} success={res.success} :: {res.message}")
         
 
     def d_modB_dparams(self):
@@ -622,24 +656,3 @@ class BoozerSurfaceQI(BaseQIField, Optimizable):
         grad[:,:,2+self.DN:]  = - self.Bmin * epsilon * np.sin(self._eta_grid[:,:,None]) * d_eta_d_sparams
 
         return grad
-
-        
-        
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                
-        
-        

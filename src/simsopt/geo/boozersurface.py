@@ -772,9 +772,9 @@ class BoozerSurface(Optimizable):
 
     def solve_residual_equation_exactly_newton(self, tol=1e-10, maxiter=10, iota=0., G=None, verbose=False):
         """
-        The function implements the BoozerExact approach by solving residual equation exactly using Newtons 
+        The function implements the BoozerExact approach by solving residual equation exactly using Newtons
         method.  
-        
+
         For Newton's method to be applied, we need the right balance of quadrature points, degrees
         of freedom and constraints.  For this reason, this function is only implemented for
         surfaces of type :obj:`~simsopt.geo.SurfaceXYZTensorFourier` right now.
@@ -845,7 +845,7 @@ class BoozerSurface(Optimizable):
             iota (float, Optional): The initial guess for the value of the rotational transform on the surface. Defaults to 0.
             G (float, Optional): The initial guess for the value of G on the surface. Defaults to None.
             verbose (bool, Optional): If True, print the optimization progress. Defaults to False.
-        
+
         Returns:
             dict: A dictionary containing the results of the optimization. The dictionary contains the following keys in addition
             to others:
@@ -879,8 +879,7 @@ class BoozerSurface(Optimizable):
         # that we need to keep, and False for those that we ignore.
         m = s.get_stellsym_mask()
         mask = np.concatenate((m[..., None], m[..., None], m[..., None]), axis=2)
-        if s.stellsym:
-            mask[0, 0, 0] = False
+        mask[0, 0, 0] = False
         mask = mask.flatten()
 
         label = self.label
@@ -894,8 +893,8 @@ class BoozerSurface(Optimizable):
             if s.stellsym:
                 b = np.concatenate((r[mask], [(label.J()-self.targetlabel)]))
             else:
-                b = np.concatenate((r[mask], [(label.J()-self.targetlabel), s.gamma()[0, 0, 2]]))
-            norm = np.linalg.norm(b)
+                b = np.concatenate((r[mask], [(label.J()-self.targetlabel), s.gamma()[0, 0, 1], s.gamma()[0, 0, 2]]))
+            norm = np.linalg.norm(b, ord=np.inf)
             if norm <= tol:
                 break
             if s.stellsym:
@@ -907,6 +906,7 @@ class BoozerSurface(Optimizable):
                 J = np.vstack((
                     J[mask, :],
                     np.concatenate((label.dJ(partials=True)(s), [0., 0.])),
+                    np.concatenate((s.dgamma_by_dcoeff()[0, 0, 1, :], [0., 0.])),
                     np.concatenate((s.dgamma_by_dcoeff()[0, 0, 2, :], [0., 0.]))
                 ))
             dx = np.linalg.solve(J, b)
@@ -927,6 +927,7 @@ class BoozerSurface(Optimizable):
             J = np.vstack((
                 J[mask, :],
                 np.concatenate((label.dJ(partials=True)(s), [0., 0.])),
+                np.concatenate((s.dgamma_by_dcoeff()[0, 0, 1, :], [0., 0.])),
                 np.concatenate((s.dgamma_by_dcoeff()[0, 0, 2, :], [0., 0.]))
             ))
 
