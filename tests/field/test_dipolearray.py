@@ -4,8 +4,10 @@ import unittest
 import numpy as np
 
 from simsopt._core.json import GSONDecoder, GSONEncoder, SIMSON
-from simsopt.field import BiotSavart, Coil, Current, DipoleArrayField, coils_via_symmetries
-from simsopt.geo import CurveXYZFourier
+from simsopt.field import BiotSavart, Coil, Current, DipoleArrayField, coils_via_symmetries, ImageCurve
+from simsopt.field import apply_symmetries_to_curves
+from simsopt.geo import (CurveXYZFourier, SurfaceRZFourier, CurvePlanarOnSurface,
+                         CurveSuperEllipse, ScaledCurveSuperEllipse, RotatedCurve)
 
 
 def make_coils(nfp=2, stellsym=True, nq=40):
@@ -119,6 +121,160 @@ class TestDipoleArrayField(unittest.TestCase):
         c2.set_points(self.pts)
         self.assertLess(rel(c2.B(), f2.B()), 1e-15)
         self.assertGreater(rel(c2.B(), self.field.B()), 1e-3)
+
+
+
+def make_dipoles(nphi=6, ntheta=4, free=True, seed=2):
+    """Small dipole array: ntheta rows of CurvePlanarOnSurface (own a, b, n) rotated to nphi toroidal positions,
+    plus a flipped copy of each row; currents: one free dof per row (+- sign for the flipped copy) and a fixed
+    planar TF-like frozen coil.  Returns the 1:1 Coil list."""
+    rng = np.random.default_rng(seed)
+    surf = SurfaceRZFourier(nfp=1, stellsym=True, mpol=1, ntor=0,
+                            quadpoints_phi=(np.arange(nphi) + 0.5) / nphi,
+                            quadpoints_theta=np.arange(2 * ntheta) / (2 * ntheta))
+    surf.set_rc(0, 0, 1.0)
+    surf.set_rc(1, 0, 0.3)
+    surf.set_zs(1, 0, 0.3)
+    surf.fix_all()
+    rows, currents = [], []
+    for it in range(ntheta):
+        ref = CurveSuperEllipse(24, 0.05, 0.08, 2.0)
+        shape = ScaledCurveSuperEllipse(ref, shared_dofs=(), a=0.05 + 0.01 * rng.random(), b=0.07 + 0.02 * rng.random(),
+                                        n=2.0 + 0.5 * rng.random())
+        shape.set_lower_bound('n', 1.5)
+        shape.set_upper_bound('n', 4.0)
+        if not free:
+            shape.fix_all()
+        rows.append(CurvePlanarOnSurface(shape, surf, 0, it, align="theta"))
+        currents.append(Current(1e4 * (it + 1)))
+    coils = []
+    for curve, cur in zip(rows, currents):
+        coils += [Coil(c, cur) for c in apply_symmetries_to_curves([curve], nphi, False)]
+        from simsopt.field.coil import ScaledCurrent
+        flipped = RotatedCurve(curve, 0.0, True)
+        coils += [Coil(c, ScaledCurrent(cur, -1.0)) for c in apply_symmetries_to_curves([flipped], nphi, False)]
+    tf = CurveXYZFourier(24, 1)
+    tf.set('xc(1)', 1.5)
+    tf.set('ys(1)', 1.5)
+    tf.fix_all()
+    tfc = Current(5e4)
+    tfc.fix_all()
+    coils.append(Coil(tf, tfc))
+    return coils
+
+
+class TestDipoleArrayFreeShape(unittest.TestCase):
+
+    def setUp(self):
+        self.coils = make_dipoles()
+        self.bs = BiotSavart(self.coils)
+        self.field = DipoleArrayField.from_coils(self.coils, free_shape=True)
+        rng = np.random.default_rng(7)
+        cen = np.array([c.curve.gamma().mean(axis=0) for c in self.coils])
+        self.pts = np.ascontiguousarray(cen[rng.integers(0, len(cen), 40)] + 0.1 * rng.standard_normal((40, 3)))
+        self.rng = rng
+
+    def perturbed_x(self):
+        x = self.bs.x.copy()
+        return x * (1 + 0.08 * self.rng.standard_normal(x.size))
+
+    def test_structure_and_dofs(self):
+        self.assertEqual(len(self.field.base_curves), 4)
+        self.assertEqual(self.field.x.size, self.bs.x.size)
+        self.assertEqual(self.field.x.size, 4 + 4 * 3)  # 4 free currents + a,b,n of 4 base curves
+        self.assertTrue(np.array_equal(self.field.x, self.bs.x))
+        self.assertTrue(np.array_equal(self.field.lower_bounds, self.bs.lower_bounds))
+        self.assertTrue(np.array_equal(self.field.upper_bounds, self.bs.upper_bounds))
+        # the TF-like coil is frozen, the dipoles are images of the 4 base curves
+        self.assertEqual(int(np.sum(self.field.image_base < 0)), 1)
+        # graph: the field has few ancestors, not one per coil
+        self.assertLess(len(self.field.ancestors), 4 * 3 + 5)
+        for c, cf in zip(self.coils, self.field.curves):
+            self.assertLess(np.max(np.abs(c.curve.gamma() - cf.gamma())), 1e-14)
+            self.assertLess(np.max(np.abs(c.curve.gammadash() - cf.gammadash())), 1e-13)
+
+    def test_field_derivatives_and_vjps_vs_biotsavart(self):
+        self.bs.set_points(self.pts)
+        self.field.set_points(self.pts)
+        for trial in range(2):
+            if trial:
+                x = self.perturbed_x()
+                self.bs.x = x
+                self.field.x = x
+            self.assertLess(rel(self.field.B(), self.bs.B()), 1e-13)
+            self.assertLess(rel(self.field.dB_by_dX(), self.bs.dB_by_dX()), 1e-13)
+            self.assertLess(rel(self.field.d2B_by_dXdX(), self.bs.d2B_by_dXdX()), 1e-13)
+            v = self.rng.standard_normal(self.pts.shape)
+            vg = self.rng.standard_normal((len(self.pts), 3, 3))
+            go, gn = self.bs.B_vjp(v)(self.bs), self.field.B_vjp(v)(self.field)
+            self.assertEqual(go.shape, gn.shape)
+            self.assertLess(rel(gn, go), 1e-11)
+            (o1, o2), (n1, n2) = self.bs.B_and_dB_vjp(v, vg), self.field.B_and_dB_vjp(v, vg)
+            self.assertLess(rel(n1(self.field), o1(self.bs)), 1e-11)
+            self.assertLess(rel(n2(self.field), o2(self.bs)), 1e-11)
+            self.assertLess(rel((n1 + n2)(self.field), (o1 + o2)(self.bs)), 1e-11)
+
+    def test_shape_finite_differences(self):
+        self.field.set_points(self.pts)
+        v = self.rng.standard_normal(self.pts.shape)
+        x0 = np.array(self.field.x)
+        g = self.field.B_vjp(v)(self.field)
+        for k in range(4, x0.size):
+            h = 1e-6
+            vals = []
+            for sgn in (+1, -1):
+                x = x0.copy()
+                x[k] += sgn * h
+                self.field.x = x
+                vals.append(np.sum(v * self.field.B()))
+            fd = (vals[0] - vals[1]) / (2 * h)
+            self.assertAlmostEqual(fd, g[k], delta=1e-6 * np.max(np.abs(g[4:])))
+        self.field.x = x0
+
+    def test_current_only_change_reuses_unit_fields_and_shape_change_recomputes_images(self):
+        import simsopt.field.dipolearray as da
+        self.field.set_points(self.pts)
+        self.field.B()
+        calls = []
+        orig = DipoleArrayField._unit_fields
+        def spy(s, idx, pts, derivatives):
+            calls.append(len(list(idx)))
+            return orig(s, idx, pts, derivatives)
+        DipoleArrayField._unit_fields = spy
+        try:
+            x = self.field.x.copy()
+            x[:4] *= 1.1
+            self.field.x = x
+            self.field.B()
+            self.assertEqual(calls, [])             # currents only: cached unit fields reused
+            x = self.field.x.copy()
+            x[4:7] *= 1.05                          # shape of base curve 0 only
+            self.field.x = x
+            self.field.B()
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0], len(self.field._base_members[0]))
+        finally:
+            DipoleArrayField._unit_fields = orig
+        self.bs.x = self.field.x
+        self.bs.set_points(self.pts)
+        self.assertLess(rel(self.field.B(), self.bs.B()), 1e-13)
+
+    def test_json_round_trip(self):
+        s = json.dumps(SIMSON([self.field]), cls=GSONEncoder)
+        (f2,) = json.loads(s, cls=GSONDecoder)
+        self.assertTrue(np.array_equal(f2.x, self.field.x))
+        self.assertTrue(np.array_equal(f2.lower_bounds, self.field.lower_bounds))
+        self.assertEqual(len(f2.base_curves), 4)
+        self.field.set_points(self.pts)
+        f2.set_points(self.pts)
+        self.assertLess(rel(f2.B(), self.field.B()), 1e-13)
+        x = self.perturbed_x()
+        f2.x = x
+        self.field.x = x
+        v = self.rng.standard_normal(self.pts.shape)
+        self.assertLess(rel(f2.B(), self.field.B()), 1e-13)
+        self.assertLess(rel(f2.B_vjp(v)(f2), self.field.B_vjp(v)(self.field)), 1e-12)
+
 
 
 if __name__ == "__main__":
