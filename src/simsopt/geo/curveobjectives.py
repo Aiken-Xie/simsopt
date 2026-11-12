@@ -239,7 +239,10 @@ class CurveCurveDistance(Optimizable):
         self.dJ_dl2 = jit(lambda gamma1, l1, gamma2, l2, dsample: grad(self.J_jax, argnums=3)(gamma1, l1, gamma2, l2, dsample), **args)
         self.candidates = None
         self.num_basecurves = num_basecurves or len(curves)
-        super().__init__(depends_on=curves)
+        # ``curves`` may contain non-Optimizable views (FrozenCurve, ImageCurve of a DipoleArrayField);
+        # image curves depend on their base curves
+        from ..field.dipolearray import curve_dependencies
+        super().__init__(depends_on=curve_dependencies(curves))
 
     def recompute_bell(self, parent=None):
         self.candidates = None
@@ -298,6 +301,11 @@ class CurveCurveDistance(Optimizable):
             dgamma_by_dcoeff_vjp_vecs[j] += self.dJ_dgamma2(gamma1, l1, gamma2, l2, self.downsample)
             dgammadash_by_dcoeff_vjp_vecs[j] += self.dJ_dl2(gamma1, l1, gamma2, l2, self.downsample)
 
+        from ..field.dipolearray import ImageCurve, sum_curve_vjps
+        if any(isinstance(c, ImageCurve) for c in self.curves):
+            # symmetry images of base curves: only curves in candidate pairs carry a cotangent; one vjp per base curve
+            active = sorted({k for pair in self.candidates for k in pair})
+            return sum_curve_vjps(self.curves, dgamma_by_dcoeff_vjp_vecs, dgammadash_by_dcoeff_vjp_vecs, active=active)
         res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
         return sum(res)
 
@@ -355,7 +363,10 @@ class CurveSurfaceDistance(Optimizable):
         self.dJ_dlc = jit(lambda gammac, lc, gammas, ns: grad(self.J_jax, argnums=1)(gammac, lc, gammas, ns))
         self.dJ_dsurface = jit(lambda gammac, lc, gammas, ns: grad(self.J_jax, argnums=(2, 3))(gammac, lc, gammas, ns))
         self.candidates = None
-        super().__init__(depends_on=list(curves) + [surface])
+        # ``curves`` may contain non-Optimizable views (FrozenCurve, ImageCurve of a DipoleArrayField);
+        # image curves depend on their base curves
+        from ..field.dipolearray import curve_dependencies
+        super().__init__(depends_on=curve_dependencies(curves) + [surface])
 
     def recompute_bell(self, parent=None):
         self.candidates = None
@@ -415,7 +426,13 @@ class CurveSurfaceDistance(Optimizable):
             dgammas, dns = self.dJ_dsurface(gammac, lc, gammas, ns)
             dJ_dgammas += dgammas
             dJ_dns += dns
-        res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
+        from ..field.dipolearray import ImageCurve, sum_curve_vjps
+        if any(isinstance(c, ImageCurve) for c in self.curves):
+            # symmetry images of base curves: only candidates carry a cotangent; one vjp per base curve
+            res = [sum_curve_vjps(self.curves, dgamma_by_dcoeff_vjp_vecs, dgammadash_by_dcoeff_vjp_vecs,
+                                  active=[i for i, _ in self.candidates])]
+        else:
+            res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
         res.append(Derivative({self.surface: self.surface.dgamma_by_dcoeff_vjp(dJ_dgammas.reshape(shape))
                                              + self.surface.dnormal_by_dcoeff_vjp(dJ_dns.reshape(shape))}))
         return sum(res)

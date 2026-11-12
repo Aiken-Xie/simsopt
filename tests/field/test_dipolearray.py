@@ -6,7 +6,7 @@ import numpy as np
 from simsopt._core.json import GSONDecoder, GSONEncoder, SIMSON
 from simsopt.field import BiotSavart, Coil, Current, DipoleArrayField, coils_via_symmetries, ImageCurve
 from simsopt.field import apply_symmetries_to_curves
-from simsopt.geo import (CurveXYZFourier, SurfaceRZFourier, CurvePlanarOnSurface,
+from simsopt.geo import (CurveXYZFourier, SurfaceRZFourier, CurveSurfaceDistance, CurveCurveDistance, CurvePlanarOnSurface,
                          CurveSuperEllipse, ScaledCurveSuperEllipse, RotatedCurve)
 
 
@@ -122,6 +122,16 @@ class TestDipoleArrayField(unittest.TestCase):
         self.assertLess(rel(c2.B(), f2.B()), 1e-15)
         self.assertGreater(rel(c2.B(), self.field.B()), 1e-3)
 
+    def test_frozen_curves_in_curve_surface_distance(self):
+        s = SurfaceRZFourier(nfp=2, stellsym=True, mpol=1, ntor=0,
+                             quadpoints_phi=np.linspace(0, 0.5, 8, endpoint=False), quadpoints_theta=np.linspace(0, 1, 8, endpoint=False))
+        s.set_rc(0, 0, 1.0)
+        s.set_rc(1, 0, 0.3)
+        s.set_zs(1, 0, 0.3)
+        old = CurveSurfaceDistance([c.curve for c in self.coils], s, 0.5)
+        new = CurveSurfaceDistance(self.field.curves, s, 0.5)
+        self.assertAlmostEqual(old.J(), new.J(), places=12)
+        self.assertLess(np.max(np.abs(old.dJ(partials=True)(s) - new.dJ(partials=True)(s))), 1e-10)
 
 
 def make_dipoles(nphi=6, ntheta=4, free=True, seed=2):
@@ -275,6 +285,53 @@ class TestDipoleArrayFreeShape(unittest.TestCase):
         self.assertLess(rel(f2.B(), self.field.B()), 1e-13)
         self.assertLess(rel(f2.B_vjp(v)(f2), self.field.B_vjp(v)(self.field)), 1e-12)
 
+    def test_image_curves_in_curve_surface_distance(self):
+        s = SurfaceRZFourier(nfp=1, stellsym=True, mpol=1, ntor=0,
+                             quadpoints_phi=np.linspace(0, 1, 12, endpoint=False), quadpoints_theta=np.linspace(0, 1, 8, endpoint=False))
+        s.set_rc(0, 0, 1.0)
+        s.set_rc(1, 0, 0.25)
+        s.set_zs(1, 0, 0.25)
+        s.fix_all()
+        dip = [i for i in range(len(self.coils) - 1)]
+        old = CurveSurfaceDistance([self.coils[i].curve for i in dip], s, 0.2)
+        new = CurveSurfaceDistance([self.field.curves[i] for i in dip], s, 0.2)
+        self.assertAlmostEqual(old.J(), new.J(), places=12)
+        self.assertGreater(old.J(), 0)
+        self.assertEqual(new.x.size, self.field.x.size - 4)  # shape dofs only (currents are not curve dofs)
+        # the gradient w.r.t. the base shape dofs equals the one through the real coil curves
+        go = dict(zip(old.dof_names, old.dJ()))
+        gn = dict(zip(new.dof_names, new.dJ()))
+        self.assertEqual(set(go), set(gn))
+        scale = max(abs(v) for v in go.values())
+        self.assertGreater(scale, 0)
+        self.assertLess(max(abs(go[k] - gn[k]) for k in go), 1e-9 * scale)
+        # and it follows a shape change of the field's base curves
+        x = self.perturbed_x()
+        self.field.x = x
+        self.bs.x = x
+        self.assertAlmostEqual(old.J(), new.J(), places=12)
+
+    def test_image_curves_in_curve_curve_distance(self):
+        """Dipole-dipole overlap penalty on the symmetry images: value and shape gradient equal the real-curve ones."""
+        dip = list(range(len(self.coils) - 1))
+        for dmin in (0.2, 1e-4):  # many candidate pairs / none
+            old = CurveCurveDistance([self.coils[i].curve for i in dip], dmin)
+            new = CurveCurveDistance([self.field.curves[i] for i in dip], dmin)
+            self.assertAlmostEqual(old.J(), new.J(), places=12)
+            go = dict(zip(old.dof_names, old.dJ()))
+            gn = dict(zip(new.dof_names, new.dJ()))
+            self.assertEqual(set(go), set(gn))
+            scale = max(max(abs(v) for v in go.values()), 1e-300)
+            self.assertLess(max(abs(go[k] - gn[k]) for k in go), 1e-9 * scale)
+            if dmin == 0.2:
+                self.assertGreater(old.J(), 0)
+        x = self.perturbed_x()
+        self.field.x = x
+        self.bs.x = x
+        old = CurveCurveDistance([self.coils[i].curve for i in dip], 0.2)
+        new = CurveCurveDistance([self.field.curves[i] for i in dip], 0.2)
+        self.assertAlmostEqual(old.J(), new.J(), places=12)
+
     def _loop_vs_batched(self, fn):
         """Run ``fn()`` with the batched vjp path and with it disabled (per-curve loop); return both results."""
         import simsopt.field.dipolearray as da
@@ -291,6 +348,13 @@ class TestDipoleArrayFreeShape(unittest.TestCase):
         import simsopt.field.dipolearray as da
         self.assertTrue(da._batchable(self.field.base_curves))
         self.field.set_points(self.pts)
+        s = SurfaceRZFourier(nfp=1, stellsym=True, mpol=1, ntor=0,
+                             quadpoints_phi=np.linspace(0, 1, 12, endpoint=False), quadpoints_theta=np.linspace(0, 1, 8, endpoint=False))
+        s.set_rc(0, 0, 1.0)
+        s.set_rc(1, 0, 0.25)
+        s.set_zs(1, 0, 0.25)
+        s.fix_all()
+        dip = list(range(len(self.coils) - 1))
         for trial in range(2):
             if trial:
                 self.field.x = self.perturbed_x()
@@ -302,6 +366,11 @@ class TestDipoleArrayFreeShape(unittest.TestCase):
                 lambda: tuple(d(self.field) for d in self.field.B_and_dB_vjp(v, vg)))
             self.assertLess(rel(a1, b1), 1e-12)
             self.assertLess(rel(a2, b2), 1e-12)
+            for pen in (lambda: CurveSurfaceDistance([self.field.curves[i] for i in dip], s, 0.2),
+                        lambda: CurveCurveDistance([self.field.curves[i] for i in dip], 0.2)):
+                a, b = self._loop_vs_batched(lambda: np.array(pen().dJ()))
+                self.assertGreater(np.max(np.abs(b)), 0)
+                self.assertLess(rel(a, b), 1e-12)
 
     def test_batched_vjp_fallback_with_partly_fixed_dofs(self):
         """One base curve with a fixed dof (a slot mismatch would show) and the unbatchable fallback are still correct."""
