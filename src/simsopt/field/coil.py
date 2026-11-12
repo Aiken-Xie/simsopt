@@ -15,6 +15,18 @@ __all__ = ['Coil', 'RegularizedCoil', 'CircularRegularizedCoil', 'RectangularReg
            ]
 
 
+def _has_free_dofs(opt):
+    """True if ``opt`` or any of its ancestors has a free dof.
+
+    Cheaper than ``np.any(opt.dofs_free_status)``: no concatenation, and it stops at the first
+    Optimizable with a free dof.
+    """
+    for o in opt.unique_dof_lineage:
+        if o._dofs._free.any():
+            return True
+    return False
+
+
 class Coil(sopp.Coil, Optimizable):
     """
     Represents a magnetic coil as a combination of a geometric curve and an electric current.
@@ -50,6 +62,10 @@ class Coil(sopp.Coil, Optimizable):
         Returns:
             The vector-Jacobian product of the coil.
         """
+        if not _has_free_dofs(self.curve):
+            # The curve geometry is fixed: its contributions would only land on fixed dofs, which
+            # Derivative.__call__ discards. Skipping the curve vjp leaves every free-dof derivative unchanged.
+            return self.current.vjp(v_current)
         return self.curve.dgamma_by_dcoeff_vjp(v_gamma) \
             + self.curve.dgammadash_by_dcoeff_vjp(v_gammadash) \
             + self.current.vjp(v_current)
