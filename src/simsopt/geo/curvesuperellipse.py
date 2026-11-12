@@ -268,12 +268,14 @@ class ScaledCurveSuperEllipse(sopp.Curve, Curve):
         Curve.__init__(self, names=self._make_names(), depends_on=[curve_to_scale],
                        external_dof_setter=ScaledCurveSuperEllipse.set_dofs_impl, **kwargs)
         
-        if 'n' in self._local_names:
-            self.set_lower_bound('n', 1.0) # pyright: ignore[reportArgumentType]
-        if 'a' in self._local_names:
-            self.set_lower_bound('a', 1e-12) # pyright: ignore[reportArgumentType]
-        if 'b' in self._local_names:
-            self.set_lower_bound('b', 1e-12) # pyright: ignore[reportArgumentType]
+        # default bounds only for a fresh curve: loading from JSON (``dofs`` given) keeps the saved bounds
+        if dofs is None:
+            if 'n' in self._local_names:
+                self.set_lower_bound('n', 1.0) # pyright: ignore[reportArgumentType]
+            if 'a' in self._local_names:
+                self.set_lower_bound('a', 1e-12) # pyright: ignore[reportArgumentType]
+            if 'b' in self._local_names:
+                self.set_lower_bound('b', 1e-12) # pyright: ignore[reportArgumentType]
 
     @property
     def a(self):
