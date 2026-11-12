@@ -82,6 +82,22 @@ class SuperEllipseTesting(unittest.TestCase):
         self.assertEqual(list(row.local_dof_names), ['b'])
         self.assertEqual(len(placed.dof_names), 3 + surface.dof_size)
 
+    def test_json_round_trip_keeps_dof_bounds(self):
+        # Loading from JSON must not overwrite the saved bounds with the default ones.
+        from simsopt._core.json import GSONDecoder, GSONEncoder, SIMSON
+        import json
+        shared = CurveSuperEllipse(32, 0.030, 0.075, 4.0)
+        row = ScaledCurveSuperEllipse(shared, shared_dofs=("a", "n"), b=0.068)
+        # default bound of a fresh curve
+        self.assertEqual(row.local_lower_bounds[0], 1e-12)
+        row.set_lower_bound('b', 0.04)
+        row.set_upper_bound('b', 0.1)
+        s = json.dumps(SIMSON(row), cls=GSONEncoder)
+        row2 = json.loads(s, cls=GSONDecoder)
+        self.assertEqual(row2.local_lower_bounds[0], 0.04)
+        self.assertEqual(row2.local_upper_bounds[0], 0.1)
+        np.testing.assert_allclose(row2.gamma(), row.gamma())
+
 
 if __name__ == "__main__":
     unittest.main()
