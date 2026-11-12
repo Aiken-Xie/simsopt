@@ -417,3 +417,66 @@ class CoilFormatConvertTesting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoilFixedCurveVjpTesting(unittest.TestCase):
+    """``Coil.vjp`` may skip the curve vjp for curves without free dofs; free-dof derivatives must not change."""
+
+    def _coils(self, free):
+        """Four coils: modular coil 0 (shape fixed / partly free / free as given by ``free``) plus symmetric images,
+        a second fixed coil and a free coil.  All currents are free."""
+        base = CurveXYZFourier(24, 2)
+        rng = np.random.RandomState(3)
+        base.x = 0.05 * rng.randn(base.dof_size)
+        base.set('xc(1)', 1.0)
+        base.set('ys(1)', 1.0)
+        base.fix_all()
+        if free == 'partly':
+            base.unfix('xc(1)')
+        elif free == 'all':
+            base.unfix_all()
+        coils = coils_via_symmetries([base], [Current(1e5)], 2, True)
+        other = CurveXYZFourier(24, 2)
+        other.x = 0.05 * rng.randn(other.dof_size)
+        other.set('xc(1)', 0.5)
+        other.set('zs(1)', 0.5)
+        other.fix_all()
+        coils.append(Coil(other, Current(2e4)))
+        coils[-1].current.unfix_all()
+        for c in coils:
+            c.current.unfix_all()
+        return coils
+
+    def test_free_dof_derivatives_unchanged(self):
+        pts = np.random.RandomState(1).uniform(-0.3, 0.3, (20, 3))
+        v = np.random.RandomState(2).randn(20, 3)
+        for free in ('none', 'partly', 'all'):
+            with self.subTest(free=free):
+                def grads_for_current_vjp():
+                    coils = self._coils(free)
+                    bs = BiotSavart(coils).set_points(pts)
+                    return (bs.B_vjp(v)(bs), bs.B_and_dB_vjp(v, np.random.RandomState(4).randn(20, 3, 3))[0](bs))
+
+                def full_vjp(self, vg, vgd, vc):
+                    return self.curve.dgamma_by_dcoeff_vjp(vg) + self.curve.dgammadash_by_dcoeff_vjp(vgd) + self.current.vjp(vc)
+
+                with patch.object(Coil, "vjp", full_vjp):
+                    ref = grads_for_current_vjp()
+                new = grads_for_current_vjp()
+                self.assertEqual(new[0].shape, ref[0].shape)
+                self.assertGreater(np.abs(ref[0]).max(), 0)
+                np.testing.assert_allclose(new[0], ref[0], rtol=1e-12, atol=1e-12 * np.abs(ref[0]).max())
+                np.testing.assert_allclose(new[1], ref[1], rtol=1e-12, atol=1e-12 * np.abs(ref[1]).max())
+
+    def test_skip_only_for_curves_without_free_dofs(self):
+        counts = {}
+        for free in ('none', 'all'):
+            coils = self._coils(free)
+            curve = coils[0].curve
+            calls = []
+            orig = curve.dgamma_by_dcoeff_vjp
+            curve.dgamma_by_dcoeff_vjp = lambda v, orig=orig, calls=calls: (calls.append(1), orig(v))[1]
+            coils[0].vjp(np.ones((24, 3)), np.ones((24, 3)), np.ones(1))
+            counts[free] = len(calls)
+        self.assertEqual(counts['none'], 0)
+        self.assertGreater(counts['all'], 0)
