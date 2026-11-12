@@ -275,6 +275,54 @@ class TestDipoleArrayFreeShape(unittest.TestCase):
         self.assertLess(rel(f2.B(), self.field.B()), 1e-13)
         self.assertLess(rel(f2.B_vjp(v)(f2), self.field.B_vjp(v)(self.field)), 1e-12)
 
+    def _loop_vs_batched(self, fn):
+        """Run ``fn()`` with the batched vjp path and with it disabled (per-curve loop); return both results."""
+        import simsopt.field.dipolearray as da
+        batched = fn()
+        orig = da._batchable
+        da._batchable = lambda bases: False
+        try:
+            looped = fn()
+        finally:
+            da._batchable = orig
+        return batched, looped
+
+    def test_batched_vjp_matches_per_curve_loop(self):
+        import simsopt.field.dipolearray as da
+        self.assertTrue(da._batchable(self.field.base_curves))
+        self.field.set_points(self.pts)
+        for trial in range(2):
+            if trial:
+                self.field.x = self.perturbed_x()
+            v = self.rng.standard_normal(self.pts.shape)
+            vg = self.rng.standard_normal((len(self.pts), 3, 3))
+            a, b = self._loop_vs_batched(lambda: self.field.B_vjp(v)(self.field))
+            self.assertLess(rel(a, b), 1e-12)
+            (a1, a2), (b1, b2) = self._loop_vs_batched(
+                lambda: tuple(d(self.field) for d in self.field.B_and_dB_vjp(v, vg)))
+            self.assertLess(rel(a1, b1), 1e-12)
+            self.assertLess(rel(a2, b2), 1e-12)
+
+    def test_batched_vjp_fallback_with_partly_fixed_dofs(self):
+        """One base curve with a fixed dof (a slot mismatch would show) and the unbatchable fallback are still correct."""
+        import simsopt.field.dipolearray as da
+        coils = make_dipoles()
+        field = DipoleArrayField.from_coils(coils, free_shape=True)
+        base = field.base_curves[0]
+        base.curve.fix('b')  # 'b' of the first base curve
+        bs = BiotSavart(coils)
+        self.assertEqual(field.x.size, bs.x.size)
+        field.set_points(self.pts)
+        bs.set_points(self.pts)
+        x = bs.x * (1 + 0.05 * self.rng.standard_normal(bs.x.size))
+        field.x = x
+        bs.x = x
+        v = self.rng.standard_normal(self.pts.shape)
+        a, b = self._loop_vs_batched(lambda: field.B_vjp(v)(field))
+        self.assertLess(rel(a, b), 1e-12)
+        self.assertLess(rel(a, bs.B_vjp(v)(bs)), 1e-11)
+        # unbatchable: bases of mixed type fall back to the loop
+        self.assertIsNone(da.batched_base_vjps(field.base_curves[:1], [np.zeros((24, 3))], [np.zeros((24, 3))]))
 
 
 if __name__ == "__main__":

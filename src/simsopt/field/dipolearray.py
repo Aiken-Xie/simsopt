@@ -21,7 +21,7 @@ from .._core.optimizable import Optimizable
 from .magneticfield import MagneticField
 
 __all__ = ['DipoleArrayCurrents', 'DipoleArrayField', 'FrozenCurve', 'ImageCurve', 'detect_images',
-           'sum_curve_vjps', 'curve_dependencies']
+           'sum_curve_vjps', 'curve_dependencies', 'batched_base_vjps']
 
 
 class DipoleArrayCurrents(Optimizable):
@@ -136,6 +136,78 @@ def _has_free(opt):
     return any(o._dofs._free.any() for o in opt.unique_dof_lineage)
 
 
+_BATCH_VJP = None
+
+
+def _batch_vjp_fn():
+    """Jitted, vmapped (over base curves) vjp of the superellipse gamma and gammadash w.r.t. its 10 dofs."""
+    global _BATCH_VJP
+    if _BATCH_VJP is None:
+        import jax
+        import jax.numpy as jnp
+        from ..geo.curvesuperellipse import curve_superellipse_pure
+
+        def one(d, wg, wd, q):
+            gam = lambda x: curve_superellipse_pure(x, q)
+            gamd = lambda x: jax.jvp(lambda p: curve_superellipse_pure(x, p), (q,), (jnp.ones_like(q),))[1]
+            return jax.vjp(gam, d)[1](wg)[0] + jax.vjp(gamd, d)[1](wd)[0]
+        _BATCH_VJP = jax.jit(jax.vmap(one, in_axes=(0, 0, 0, None)))
+    return _BATCH_VJP
+
+
+def _batchable(bases):
+    """True when all ``bases`` are CurvePlanarOnSurface(ScaledCurveSuperEllipse) with the same quadpoints and a fixed surface."""
+    from ..geo import CurvePlanarOnSurface
+    from ..geo.curvesuperellipse import ScaledCurveSuperEllipse
+    if len(bases) < 2:
+        return False
+    q0 = None
+    for b in bases:
+        if not isinstance(b, CurvePlanarOnSurface) or not isinstance(b.curve, ScaledCurveSuperEllipse):
+            return False
+        if _has_free(b.surface):
+            return False
+        q = np.asarray(b.curve.curve.quadpoints)
+        if q0 is None:
+            q0 = q
+        elif q.shape != q0.shape or not np.array_equal(q, q0):
+            return False
+    return True
+
+
+def batched_base_vjps(bases, rgs, rds):
+    """Per base curve ``dgamma_by_dcoeff_vjp(rg) + dgammadash_by_dcoeff_vjp(rd)`` in ONE jitted vmapped JAX call.
+
+    ``bases`` are CurvePlanarOnSurface curves wrapping a ScaledCurveSuperEllipse (identical quadpoints, fixed
+    winding surface); ``rgs``/``rds`` the cotangents ``(nbase, nq, 3)``.  Returns the list of ``Derivative``s
+    (same dof slots as the per-curve vjps; the fixed surface contributes nothing) or None when the bases are
+    not batchable (the caller then loops over the base curves).
+    """
+    if not _batchable(bases):
+        return None
+    import jax.numpy as jnp
+    F, BR, dofs = [], [], []
+    for b in bases:
+        b.curve._update_curve()
+        n = np.asarray(b.surface.unitnormal()[b.iphi, b.itheta])
+        t = np.asarray(b.surface.gammadash2()[b.iphi, b.itheta] if b.align == "theta"
+                       else b.surface.gammadash1()[b.iphi, b.itheta])
+        e3 = n / np.linalg.norm(n)
+        t = t - (t @ e3) * e3
+        e1 = t / np.linalg.norm(t)
+        F.append(np.stack((e1, np.cross(e3, e1), e3), axis=-1))
+        BR.append(b.base_rotation)
+        dofs.append(b.curve.curve.get_dofs())
+    F, BR, dofs = np.array(F), np.array(BR), np.array(dofs)
+    rgs, rds = np.asarray(rgs), np.asarray(rds)
+    # w = (v @ F) @ BR^T, per base curve
+    wg = np.einsum('jni,jik,jlk->jnl', rgs, F, BR)
+    wd = np.einsum('jni,jik,jlk->jnl', rds, F, BR)
+    q = jnp.asarray(np.asarray(bases[0].curve.curve.quadpoints))
+    out = np.asarray(_batch_vjp_fn()(jnp.asarray(dofs), jnp.asarray(wg), jnp.asarray(wd), q))
+    return [b.curve._split_vjp(out[j]) for j, b in enumerate(bases)]
+
+
 def sum_curve_vjps(curves, vgamma, vgammadash, active=None):
     """``sum_i dgamma_by_dcoeff_vjp(vgamma[i]) + dgammadash_by_dcoeff_vjp(vgammadash[i])`` over ``curves[i]``.
 
@@ -158,10 +230,11 @@ def sum_curve_vjps(curves, vgamma, vgammadash, active=None):
         else:
             term = c.dgamma_by_dcoeff_vjp(vgamma[i]) + c.dgammadash_by_dcoeff_vjp(vgammadash[i])
             res = term if res is None else res + term
-    for base, rg, rd in groups.values():
-        if not _has_free(base):
-            continue
-        term = base.dgamma_by_dcoeff_vjp(rg) + base.dgammadash_by_dcoeff_vjp(rd)
+    todo = [e for e in groups.values() if _has_free(e[0])]
+    terms = batched_base_vjps([e[0] for e in todo], [e[1] for e in todo], [e[2] for e in todo]) if todo else []
+    if terms is None:
+        terms = [base.dgamma_by_dcoeff_vjp(rg) + base.dgammadash_by_dcoeff_vjp(rd) for base, rg, rd in todo]
+    for term in terms:
         res = term if res is None else res + term
     return Derivative({}) if res is None else res
 
@@ -506,14 +579,18 @@ class DipoleArrayField(MagneticField):
         pos = {int(i): k for k, i in enumerate(coils)}
         for rg, rd in sets:
             total = None
+            gjs, djs = [], []
             for j in free:
                 rot = self._image_rot[self._base_members[j]]
                 ks = [pos[int(i)] for i in self._base_members[j]]
                 # gamma_i = gamma_base @ R_i  =>  dJ/dgamma_base = sum_i dJ/dgamma_i @ R_i^T
-                gj = sum(rg[k] @ R.T for k, R in zip(ks, rot))
-                dj = sum(rd[k] @ R.T for k, R in zip(ks, rot))
-                c = self._base_curves[j]
-                term = c.dgamma_by_dcoeff_vjp(gj) + c.dgammadash_by_dcoeff_vjp(dj)
+                gjs.append(sum(rg[k] @ R.T for k, R in zip(ks, rot)))
+                djs.append(sum(rd[k] @ R.T for k, R in zip(ks, rot)))
+            terms = batched_base_vjps([self._base_curves[j] for j in free], gjs, djs)
+            if terms is None:
+                terms = [self._base_curves[j].dgamma_by_dcoeff_vjp(g) + self._base_curves[j].dgammadash_by_dcoeff_vjp(d)
+                         for j, g, d in zip(free, gjs, djs)]
+            for term in terms:
                 total = term if total is None else total + term
             out.append(total)
         return out
