@@ -10,7 +10,7 @@ from simsopt._core.derivative import derivative_dec
 from simsopt.objectives import forward_backward
 from simsopt.util import proc0_print
 
-__all__ = ["OmnigenousField", "OmnigenousResidual"]
+__all__ = ["OmnigenousField", "OmnigenousResidual", "OmnigenousSlopePenalty"]
 
 class OmnigenousField(Optimizable):
     @staticmethod
@@ -75,6 +75,10 @@ class OmnigenousField(Optimizable):
         # Default helicity = (0, 1) for QI fields
         self._helicity = tuple(map(int, helicity))
         M, N = self._helicity
+        if not N and abs(M) != 1:
+            raise ValueError(f"helicity {self._helicity} is not supported: with N = 0 the angles "
+                             "assume M = ±1. A nonzero N gives |N| identical wells per field "
+                             "period.")
         self.tilde_mat = np.array([[-M*nfp, N*nfp], [1, 0]]) if N else \
                          np.array([[1, 0], [0, nfp]])
 
@@ -414,6 +418,19 @@ class OmnigenousField(Optimizable):
         dslope[:, 2+self.DN:] = -(s_xp + tilde_iota*D_x[:, None]*s_yp)
         return dslope
 
+    def dslope_by_diota(self):
+        r"""
+        Derivative of `dzeta_by_deta` with respect to iota.
+        """
+        x, y = self._slope_args()
+        tilde_iota = self._tilde_iota
+        D = np.asarray(self.Dfunc(x))
+        s_y = self.ds_by_dy(x, y)
+        s_xy = np.asarray(self._d2s_by_dxdy(x, y, self.sparams))
+        s_yy = np.asarray(self._d2s_by_dydy(x, y, self.sparams))
+        return (-(s_xy*D + (s_y + tilde_iota*s_yy*D)*self.dD_by_dx(x))
+                * self.dtilde_iota_by_diota())
+
     def dmodB_by_dparams(self):
         eta_grid = self.eta_grid
         dBdp = np.zeros((self.nphi, self.ntheta, self.ndofs))
@@ -444,16 +461,22 @@ class OmnigenousField(Optimizable):
 
         return dBdp
 
+    def dtilde_iota_by_diota(self):
+        r"""
+        Derivative of tilde iota with respect to iota. Necessary for optimizing Boozer surfaces
+        where iota changes over the optimization.
+        """
+        M, N = self.helicity
+        return -self.nfp/self.iota**2 if not N else N/((N - self.iota*M)**2 * self.nfp)
+
     def dmodB_by_diota(self):
         eta_grid = self.eta_grid
         sign, Darg, _, sargy = self.get_args()
         D    = self.Dfunc(Darg)
         s_y  = self.ds_by_dy(Darg, sargy)
         den  = self.ds_by_dx(Darg, sargy) + (1 + s_y*self.tilde_iota)*self.dD_by_dx(Darg)
-        M, N = self.helicity
-        dtilde_by_diota = (
-            -self.nfp/self.iota**2 if not N else N/((N - self.iota*M)**2 * self.nfp))
-        return -self.Bmin*self.epsilon*np.sin(eta_grid) * (sign*s_y*D/den) * dtilde_by_diota
+        return -(self.Bmin*self.epsilon*np.sin(eta_grid) * (sign*s_y*D/den)
+                 * self.dtilde_iota_by_diota())
 
     def fit_to(self, coil_modB, **kwargs):
         self.set_Bmax(float(coil_modB.max()))
@@ -630,3 +653,63 @@ class OmnigenousResidual(Optimizable):
 
         self._dJ = dJ_by_coils + dJ_by_local_x
 
+class OmnigenousSlopePenalty(Optimizable):
+    r"""
+    Penalty that keeps the eta-to-tilde-phi map of an omnigenous target invertible,
+
+    .. math::
+        J = \frac{1}{N} \sum_k \max(0, \sigma_{\min} - \sigma_k)^2,
+
+    where :math:`\sigma_k` are the slopes from `OmnigenousField.dzeta_by_deta`. The target's
+    iota is the Boozer surface's, so the gradient reaches the coils through the Boozer solve.
+
+    Args:
+        boozersurface: Boozer surface that sets the target's iota.
+        target: OmnigenousField whose map is kept invertible.
+        slope_lb: Smallest allowed slope.
+    """
+
+    def __init__(self, boozersurface, target, slope_lb=0.1):
+        Optimizable.__init__(self, depends_on=[boozersurface, target])
+        self.boozersurface = boozersurface
+        self.target = target
+        self.slope_lb = slope_lb
+
+    def recompute_bell(self, parent=None):
+        self._J = None
+        self._dJ = None
+
+    def J(self):
+        if self._J is None:
+            self.compute_objective_and_derivatives()
+        return self._J
+
+    @derivative_dec
+    def dJ(self):
+        if self._dJ is None:
+            self.compute_objective_and_derivatives()
+        return self._dJ
+
+    def compute_objective_and_derivatives(self):
+        if self.boozersurface.need_to_run_code:
+            raise RuntimeError("Need to run boozer surface first")
+        iota = self.boozersurface.res["iota"]
+        G = self.boozersurface.res["G"]
+        self.target.set_iota(iota)
+
+        shortfall = np.maximum(0., self.slope_lb - self.target.dzeta_by_deta())
+        self._J = float(np.mean(shortfall**2))
+        if not shortfall.any():
+            self._dJ = Derivative()
+            return
+
+        dJ_by_dslope = -2*shortfall/shortfall.size
+        P, L, U = self.boozersurface.res["PLU"]
+        dJ_by_dsurf = np.zeros(L.shape[0])
+        dJ_by_dsurf[-2 if G is not None else -1] = dJ_by_dslope @ self.target.dslope_by_diota()
+        adj = forward_backward(P, L, U, dJ_by_dsurf)
+        adj_times_dg_dcoil = self.boozersurface.res["vjp"](adj, self.boozersurface, iota, G)
+
+        self._dJ = (
+            Derivative({self.target: dJ_by_dslope @ self.target.dslope_by_dparams()})
+            - adj_times_dg_dcoil) # pyright: ignore[reportOperatorIssue]
