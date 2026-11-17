@@ -8,7 +8,6 @@ from scipy.optimize import NonlinearConstraint, minimize
 from simsopt._core import Derivative, Optimizable
 from simsopt._core.derivative import derivative_dec
 from simsopt.objectives import forward_backward
-from simsopt.util import proc0_print
 
 __all__ = ["OmnigenousField", "OmnigenousResidual"]
 
@@ -371,8 +370,7 @@ class OmnigenousField(Optimizable):
         self.need_to_update = False
 
     def dzeta_by_deta(self):
-        eta
-        return dzeta_by_deta
+        raise NotImplementedError("OmnigenousField.dzeta_by_deta is not implemented yet")
 
     def dmodB_by_dparams(self):
         eta_grid = self.eta_grid
@@ -416,6 +414,7 @@ class OmnigenousField(Optimizable):
         return -self.Bmin*self.epsilon*np.sin(eta_grid) * (sign*s_y*D/den) * dtilde_by_diota
 
     def fit_to(self, coil_modB, **kwargs):
+        from simsopt.util import proc0_print
         self.set_Bmax(float(coil_modB.max()))
         self.set_Bmin(float(coil_modB.min()))
         rms_modB = np.sqrt(np.mean(coil_modB**2))

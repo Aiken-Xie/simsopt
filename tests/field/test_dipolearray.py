@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 
 from simsopt._core.json import GSONDecoder, GSONEncoder, SIMSON
-from simsopt.field import BiotSavart, Coil, Current, DipoleArrayField, coils_via_symmetries, ImageCurve
+from simsopt.field import BiotSavart, Coil, Current, DipoleArrayField, coils_via_symmetries
 from simsopt.field import apply_symmetries_to_curves
 from simsopt.geo import (CurveXYZFourier, SurfaceRZFourier, CurveSurfaceDistance, CurveCurveDistance, CurvePlanarOnSurface,
                          CurveSuperEllipse, ScaledCurveSuperEllipse, RotatedCurve)
@@ -242,7 +242,6 @@ class TestDipoleArrayFreeShape(unittest.TestCase):
         self.field.x = x0
 
     def test_current_only_change_reuses_unit_fields_and_shape_change_recomputes_images(self):
-        import simsopt.field.dipolearray as da
         self.field.set_points(self.pts)
         self.field.B()
         calls = []

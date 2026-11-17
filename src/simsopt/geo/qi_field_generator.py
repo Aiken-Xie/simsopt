@@ -1,9 +1,9 @@
 import numpy as np
 from jax import numpy as jnp
-from jax import grad, vjp, jvp, jacobian
+from jax import jacobian
 from jax import jit as jaxjit
 import matplotlib.pyplot as plt
-from scipy.optimize import root, least_squares, root_scalar, minimize, NonlinearConstraint
+from scipy.optimize import root, root_scalar, minimize, NonlinearConstraint
 from simsopt._core.optimizable import Optimizable
 from simsopt._core.derivative import derivative_dec, Derivative
 from simsopt.objectives.utilities import forward_backward
@@ -84,11 +84,6 @@ class BaseQIField():
         self._neta = new_value
         self.need_to_update = True
 
-    @property
-    def eta_grid(self):
-        if self.need_to_update:
-            self.update()
-        return self._eta_grid
     @property
     def phi_grid(self):
         if self.need_to_update:
