@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 import numpy as np
 
+from simsopt._core.optimizable import DOFs
 from simsopt.geo import JaxCurve
 
 __all__ = ['CurvePlanarEllipticalCylindrical','create_equally_spaced_cylindrical_curves']
@@ -72,9 +73,10 @@ def cyl_to_cart(a):
     out = out.at[:,2].set(a[:,2]) # z = z
     return out
 
-def gamma_pure(dofs, points, a, b):
+def gamma_pure(dofs, points):
     xyz = dofs[0:3]
     ypr = dofs[3:6]
+    a, b = dofs[6:8]
     g1= xyz_cyl(a, b ,points) # generate elliptical parameterization
     g2 = rotations(g1, a, b, ypr[0], ypr[1], ypr[2], xyz[0]) # rotate and translate in R
     g3 = convert_to_cyl(g2) # convert to R, phi, Z coordinates
@@ -90,34 +92,51 @@ class CurvePlanarEllipticalCylindrical(JaxCurve):
     to a major radius R0, toroidal angle phi, and vertical position Z0. The curve is then rotated by angles
     r_rotation, phi_rotation, and z_rotation in the r, phi, and z directions, respectively, about the minimum 
     Z location of the curve.
+    The semi-axes a and b are dofs too, after the six placement dofs.
     """
 
     def __init__(self, quadpoints, a, b , dofs=None):
         if isinstance(quadpoints, int):
             quadpoints = np.linspace(0, 1, quadpoints, endpoint=False)
-        
-        pure = lambda dofs, points: gamma_pure(dofs, points, a, b)
 
-        self.coefficients = [np.zeros((3,)), np.zeros((3,))]
-        self.a = a
-        self.b = b
+        self.coefficients = [np.zeros((3,)), np.zeros((3,)), np.array([a, b], dtype=float)]
+        if dofs is not None and len(dofs.full_x) == 6:
+            # Saved before a and b were dofs: append them, fixed as they were then.
+            dofs = DOFs(np.append(dofs.full_x, [a, b]), self._make_names(),
+                        np.append(dofs.free_status, [False, False]),
+                        np.append(dofs.full_lower_bounds, [-np.inf, -np.inf]),
+                        np.append(dofs.full_upper_bounds, [np.inf, np.inf]))
         if dofs is None:
-            super().__init__(quadpoints, pure, x0=np.concatenate(self.coefficients),
+            super().__init__(quadpoints, gamma_pure, x0=np.concatenate(self.coefficients),
                              external_dof_setter=CurvePlanarEllipticalCylindrical.set_dofs_impl,
                              names=self._make_names())
         else:
-            super().__init__(quadpoints, pure, dofs=dofs,
+            super().__init__(quadpoints, gamma_pure, dofs=dofs,
                              external_dof_setter=CurvePlanarEllipticalCylindrical.set_dofs_impl,
                              names=self._make_names())
+
+    @property
+    def a(self):
+        """
+        Semi-axis along R.
+        """
+        return float(self.coefficients[2][0])
+
+    @property
+    def b(self):
+        """
+        Semi-axis along Z.
+        """
+        return float(self.coefficients[2][1])
 
     def num_dofs(self):
         """
         This function returns the number of dofs associated to this object.
         """
-        return 3 + 3
+        return 3 + 3 + 2
 
     def get_dofs(self):
-        return np.concatenate([self.coefficients[0], self.coefficients[1]])
+        return np.concatenate(self.coefficients)
 
     def set_dofs_impl(self, dofs):
         """
@@ -125,6 +144,7 @@ class CurvePlanarEllipticalCylindrical(JaxCurve):
          """
         self.coefficients[0][:] = dofs[0:3]  # R0, phi, Z0
         self.coefficients[1][:] = dofs[3:6]  # theta, constant_phi,
+        self.coefficients[2][:] = dofs[6:8]  # a, b
 
     def _make_names(self):
         """
@@ -132,7 +152,7 @@ class CurvePlanarEllipticalCylindrical(JaxCurve):
         """
         rtpz_name = ['R0', 'phi', 'Z0']
         angle_name = ['r_rotation', 'phi_rotation', 'z_rotation']
-        return rtpz_name + angle_name 
+        return rtpz_name + angle_name + ['a', 'b']
 
 def create_equally_spaced_cylindrical_curves(ncurves, nfp, stellsym, R0, a, b, numquadpoints=32):
     """
