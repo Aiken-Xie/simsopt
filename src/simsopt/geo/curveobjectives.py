@@ -455,6 +455,11 @@ class CurveSurfaceDistance(Optimizable):
     auxiliary-surface pattern :class:`NonQuasiSymmetricRatio` already uses
     for spectrally accurate evaluation, and does not change what ``surface``
     itself is solved against -- only what this penalty checks.
+
+    Without ``boozer_surface``, ``surface`` is a dependency of this penalty (merged from
+    hayashiw/simsopt ``whjh/dipole``): if its dofs are free, ``dJ()`` also returns the derivative
+    with respect to them, e.g. for a dipole winding surface that is optimized. Fix the surface's
+    dofs when it should be held fixed.
     """
 
     def __init__(self, curves, surface, minimum_distance, boozer_surface=None, surface_oversample=1):
@@ -480,8 +485,8 @@ class CurveSurfaceDistance(Optimizable):
         self.dJ_dgammas = jit(lambda gammac, lc, gammas, ns: grad(self.J_jax, argnums=2)(gammac, lc, gammas, ns))
         self.dJ_dns = jit(lambda gammac, lc, gammas, ns: grad(self.J_jax, argnums=3)(gammac, lc, gammas, ns))
         self.candidates = None
-        depends_on = list(curves) + ([boozer_surface] if boozer_surface is not None else [])
-        super().__init__(depends_on=depends_on)  # Bharat's comment: Shouldn't we add surface here
+        depends_on = list(curves) + ([boozer_surface] if boozer_surface is not None else [surface])
+        super().__init__(depends_on=depends_on)
 
     def eval_surface(self):
         """The surface to sample this penalty's surface side against: either
@@ -546,12 +551,17 @@ class CurveSurfaceDistance(Optimizable):
             lc = self.curves[i].gammadash()
             dgamma_by_dcoeff_vjp_vecs[i] += self.dJ_dgamma(gammac, lc, gammas, ns)
             dgammadash_by_dcoeff_vjp_vecs[i] += self.dJ_dlc(gammac, lc, gammas, ns)
-            if self.boozer_surface is not None:
-                dJ_dgammas_vec += self.dJ_dgammas(gammac, lc, gammas, ns)
-                dJ_dns_vec += self.dJ_dns(gammac, lc, gammas, ns)
+            dJ_dgammas_vec += self.dJ_dgammas(gammac, lc, gammas, ns)
+            dJ_dns_vec += self.dJ_dns(gammac, lc, gammas, ns)
         res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
         direct = sum(res)
         if self.boozer_surface is None:
+            # the surface is a dependency: add the derivative with respect to its own dofs
+            # (the oversampled proxy shares the surface's dof vector)
+            surface = self.eval_surface()
+            shape = surface.gamma().shape
+            direct = direct + Derivative({self.surface: surface.dgamma_by_dcoeff_vjp(dJ_dgammas_vec.reshape(shape))
+                                          + surface.dnormal_by_dcoeff_vjp(dJ_dns_vec.reshape(shape))})
             return direct
         return direct - self._boozer_surface_adjoint_correction(dJ_dgammas_vec, dJ_dns_vec)
 
