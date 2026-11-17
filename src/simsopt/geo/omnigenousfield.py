@@ -370,9 +370,49 @@ class OmnigenousField(Optimizable):
             )
         self.need_to_update = False
 
+    def _slope_args(self):
+        r"""
+        Arguments of D and s on the eta scan at each tilde theta of the grid, flattened.
+        """
+        self.update_coords()
+        eta = np.linspace(0, 2*np.pi, self.neta)[None, :]
+        tilde_theta = np.unique(self._tilde_theta_grid)[:, None]
+        sign = np.where(eta <= np.pi, 1.0, -1.0)
+        Darg = np.where(eta <= np.pi, eta, 2*np.pi - eta)
+        sargy = sign*tilde_theta + self._tilde_iota*self.Dfunc(Darg)
+        Darg, sargy = np.broadcast_arrays(Darg, sargy)
+        return Darg.ravel(), sargy.ravel()
+
     def dzeta_by_deta(self):
-        eta
-        return dzeta_by_deta
+        r"""
+        Slope of tilde phi with respect to eta, on an eta scan at each tilde theta of the grid.
+        The eta-to-tilde-phi map is invertible only while every slope remains positive.
+        """
+        x, y = self._slope_args()
+        slope = -(self.ds_by_dx(x, y) + (1 + self._tilde_iota*self.ds_by_dy(x, y))*self.dD_by_dx(x))
+        return slope
+
+    def dslope_by_dparams(self):
+        r"""
+        Derivative of `dzeta_by_deta` with respect to the dofs (Bmax, Bmin, Dparams, sparams),
+        shaped (number of slopes, number of dofs). Bmax and Bmin do not enter the slopes.
+        """
+        x, y = self._slope_args()
+        tilde_iota = self._tilde_iota
+        D_x = self.dD_by_dx(x)
+        D_p = self.dD_by_dDparams(x)
+        D_xp = np.asarray(self._d2D_by_dxdDparams(x, self.Dparams))
+        s_y = self.ds_by_dy(x, y)
+        s_xy = np.asarray(self._d2s_by_dxdy(x, y, self.sparams))
+        s_yy = np.asarray(self._d2s_by_dydy(x, y, self.sparams))
+        s_xp = np.asarray(self._d2s_by_dxdsparams(x, y, self.sparams)).reshape(x.size, -1)
+        s_yp = np.asarray(self._d2s_by_dydsparams(x, y, self.sparams)).reshape(x.size, -1)
+        dslope = np.zeros((x.size, self.ndofs))
+        dslope[:, 2:2+self.DN] = -(
+            tilde_iota*(s_xy + tilde_iota*s_yy*D_x)[:, None]*D_p
+            + (1 + tilde_iota*s_y)[:, None]*D_xp)
+        dslope[:, 2+self.DN:] = -(s_xp + tilde_iota*D_x[:, None]*s_yp)
+        return dslope
 
     def dmodB_by_dparams(self):
         eta_grid = self.eta_grid
@@ -453,6 +493,10 @@ class OmnigenousField(Optimizable):
             self.set_dofs(x)
             return self.dzeta_by_deta()
 
+        def slopes_jac(x):
+            self.set_dofs(x)
+            return self.dslope_by_dparams()
+
         x0 = self.get_dofs()
         slope_lb = kwargs.pop("slope_lb", 1e-2)
         if slopes(x0).min() <= slope_lb:
@@ -465,7 +509,7 @@ class OmnigenousField(Optimizable):
 
         if "maxiter" not in kwargs: kwargs["maxiter"] = 300
         if "ftol" not in kwargs: kwargs["ftol"] = 1e-12
-        slopes_constraint = NonlinearConstraint(slopes, slope_lb, np.inf)
+        slopes_constraint = NonlinearConstraint(slopes, slope_lb, np.inf, jac=slopes_jac)
         well_constraint = NonlinearConstraint(lambda x: np.array([x[0] - x[1], x[1]]), 1e-12, np.inf)
         bounds = [
             (1e-12, None), # Bmax
