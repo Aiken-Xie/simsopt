@@ -330,7 +330,9 @@ class CurveCurveDistance(Optimizable):
         self.dJ_dl2 = jit(lambda gamma1, l1, gamma2, l2, dsample: grad(self.J_jax, argnums=3)(gamma1, l1, gamma2, l2, dsample), **args)
         self.candidates = None
         self.num_basecurves = num_basecurves or len(curves)
-        super().__init__(depends_on=curves)
+        # (image curves of a DipoleArrayField with free shapes depend on their base curves)
+        from ..field.dipolearray import curve_dependencies
+        super().__init__(depends_on=curve_dependencies(curves))
 
     def recompute_bell(self, parent=None):
         self.candidates = None
@@ -389,6 +391,11 @@ class CurveCurveDistance(Optimizable):
             dgamma_by_dcoeff_vjp_vecs[j] += self.dJ_dgamma2(gamma1, l1, gamma2, l2, self.downsample)
             dgammadash_by_dcoeff_vjp_vecs[j] += self.dJ_dl2(gamma1, l1, gamma2, l2, self.downsample)
 
+        from ..field.dipolearray import ImageCurve, sum_curve_vjps
+        if any(isinstance(c, ImageCurve) for c in self.curves):
+            # symmetry images of base curves: only curves in candidate pairs carry a cotangent; one vjp per base curve
+            active = sorted({k for pair in self.candidates for k in pair})
+            return sum_curve_vjps(self.curves, dgamma_by_dcoeff_vjp_vecs, dgammadash_by_dcoeff_vjp_vecs, active=active)
         res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
         return sum(res)
 
@@ -485,7 +492,11 @@ class CurveSurfaceDistance(Optimizable):
         self.dJ_dgammas = jit(lambda gammac, lc, gammas, ns: grad(self.J_jax, argnums=2)(gammac, lc, gammas, ns))
         self.dJ_dns = jit(lambda gammac, lc, gammas, ns: grad(self.J_jax, argnums=3)(gammac, lc, gammas, ns))
         self.candidates = None
-        depends_on = list(curves) + ([boozer_surface] if boozer_surface is not None else [surface])
+        # curves that are not Optimizables (e.g. the fixed copies of a DipoleArrayField) have no dofs
+        # (image curves of a DipoleArrayField with free shapes depend on their base curves)
+        from ..field.dipolearray import curve_dependencies
+        depends_on = curve_dependencies(curves) \
+            + ([boozer_surface] if boozer_surface is not None else [surface])
         super().__init__(depends_on=depends_on)
 
     def eval_surface(self):
@@ -553,8 +564,14 @@ class CurveSurfaceDistance(Optimizable):
             dgammadash_by_dcoeff_vjp_vecs[i] += self.dJ_dlc(gammac, lc, gammas, ns)
             dJ_dgammas_vec += self.dJ_dgammas(gammac, lc, gammas, ns)
             dJ_dns_vec += self.dJ_dns(gammac, lc, gammas, ns)
-        res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
-        direct = sum(res)
+        from ..field.dipolearray import ImageCurve, sum_curve_vjps
+        if any(isinstance(c, ImageCurve) for c in self.curves):
+            # symmetry images of base curves: only candidates carry a cotangent; one vjp per base curve
+            direct = sum_curve_vjps(self.curves, dgamma_by_dcoeff_vjp_vecs, dgammadash_by_dcoeff_vjp_vecs,
+                                    active=[i for i, _ in self.candidates])
+        else:
+            res = [self.curves[i].dgamma_by_dcoeff_vjp(dgamma_by_dcoeff_vjp_vecs[i]) + self.curves[i].dgammadash_by_dcoeff_vjp(dgammadash_by_dcoeff_vjp_vecs[i]) for i in range(len(self.curves))]
+            direct = sum(res)
         if self.boozer_surface is None:
             # the surface is a dependency: add the derivative with respect to its own dofs
             # (the oversampled proxy shares the surface's dof vector)

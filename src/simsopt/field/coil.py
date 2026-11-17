@@ -15,6 +15,18 @@ __all__ = ['Coil', 'RegularizedCoil', 'CircularRegularizedCoil', 'RectangularReg
            ]
 
 
+def _has_free_dofs(opt):
+    """True if ``opt`` or any of its ancestors has a free dof.
+
+    Cheaper than ``np.any(opt.dofs_free_status)``: no concatenation, and it stops at the first
+    Optimizable with a free dof.
+    """
+    for o in opt.unique_dof_lineage:
+        if o._dofs._free.any():
+            return True
+    return False
+
+
 class Coil(sopp.Coil, Optimizable):
     """
     Represents a magnetic coil as a combination of a geometric curve and an electric current.
@@ -26,6 +38,9 @@ class Coil(sopp.Coil, Optimizable):
         curve (simsopt.geo.curve.Curve) : The geometric curve describing the coil shape.
         current (Current) : The current object describing the electric current in the coil.
     """
+
+    #: Skip the curve-geometry vjp in :meth:`vjp` when the curve has no free dofs.
+    skip_fixed_curve_vjp = True
 
     def __init__(self, curve, current):
         self._curve = curve
@@ -50,6 +65,11 @@ class Coil(sopp.Coil, Optimizable):
         Returns:
             The vector-Jacobian product of the coil.
         """
+        if Coil.skip_fixed_curve_vjp and not _has_free_dofs(self.curve):
+            # The curve geometry is fixed: its contributions would only be added to the
+            # entries of fixed dofs, which Derivative.__call__ discards.  Skipping the
+            # (expensive) curve vjp leaves the derivative w.r.t. every free dof unchanged.
+            return self.current.vjp(v_current)
         return self.curve.dgamma_by_dcoeff_vjp(v_gamma) \
             + self.curve.dgammadash_by_dcoeff_vjp(v_gammadash) \
             + self.current.vjp(v_current)
