@@ -90,6 +90,7 @@ class CurvePlanarOnSurface(sopp.Curve, Curve):
         self.iphi = iphi
         self.itheta = itheta
         self.align = align
+        self._frame_cache = None
         self.base_center, self.base_rotation = self._base_frame()
         self._fix_placement()
         sopp.Curve.__init__(self, curve.quadpoints)
@@ -121,24 +122,44 @@ class CurvePlanarOnSurface(sopp.Curve, Curve):
     def _local_vectors(self, vectors):
         return vectors @ self.base_rotation
 
+    def recompute_bell(self, parent=None):
+        # The winding surface (or the base curve) changed: drop the cached frame
+        # and let the Curve machinery invalidate its own gamma caches.
+        self._frame_cache = None
+        Curve.recompute_bell(self, parent)
+
+    def _frame(self):
+        """Anchor (c, n, t), frame R and the anchor derivatives, cached per state."""
+        cache = self._frame_cache
+        if cache is None:
+            i, j = self.iphi, self.itheta
+            c = np.array(self.surface.gamma()[i, j])
+            n = np.array(self.surface.unitnormal()[i, j])
+            t = np.array(self.surface.gammadash2()[i, j] if self.align == "theta"
+                         else self.surface.gammadash1()[i, j])
+            e3 = n / np.linalg.norm(n)
+            tp = t - np.dot(t, e3) * e3
+            e1 = tp / np.linalg.norm(tp)
+            e2 = np.cross(e3, e1)
+            R = np.stack((e1, e2, e3), axis=-1)
+            R.setflags(write=False)
+            dn = self.surface.dunitnormal_by_dcoeff()[i, j]
+            dt = (self.surface.dgammadash2_by_dcoeff()[i, j] if self.align == "theta"
+                  else self.surface.dgammadash1_by_dcoeff()[i, j])
+            dc = self.surface.dgamma_by_dcoeff()[i, j]
+            cache = self._frame_cache = (c, n, t, R, dc, dn, dt)
+        return cache
+
     def _anchor(self):
-        i, j = self.iphi, self.itheta
-        c = self.surface.gamma()[i, j]
-        n = self.surface.unitnormal()[i, j]
-        t = (self.surface.gammadash2()[i, j] if self.align == "theta"
-             else self.surface.gammadash1()[i, j])
-        return jnp.array(c), jnp.array(n), jnp.array(t)
+        c, n, t, _, _, _, _ = self._frame()
+        return c, n, t
 
     def _danchor(self):
-        i, j = self.iphi, self.itheta
-        dn = self.surface.dunitnormal_by_dcoeff()[i, j]
-        dt = (self.surface.dgammadash2_by_dcoeff()[i, j] if self.align == "theta"
-              else self.surface.dgammadash1_by_dcoeff()[i, j])
-        return self.surface.dgamma_by_dcoeff()[i, j], dn, dt
+        _, _, _, _, dc, dn, dt = self._frame()
+        return dc, dn, dt
 
     def rotation_matrix(self):
-        _, n, t = self._anchor()
-        return np.asarray(surface_frame_pure(n, t))
+        return self._frame()[3]
 
     def center(self):
         return self.surface.gamma()[self.iphi, self.itheta]
@@ -155,7 +176,7 @@ class CurvePlanarOnSurface(sopp.Curve, Curve):
             points = np.zeros((len(quadpoints), 3))
             self.curve.gamma_impl(points, quadpoints)
         points = self._local_points(points)
-        gamma[:] = np.asarray(place_points_pure(jnp.array(points), c, n, t))
+        gamma[:] = c[None, :] + points @ self.rotation_matrix().T
 
     def gammadash_impl(self, gammadash):
         gammadash[:] = self._local_vectors(self.curve.gammadash()) @ self.rotation_matrix().T

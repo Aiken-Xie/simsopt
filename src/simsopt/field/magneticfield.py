@@ -55,8 +55,10 @@ class MagneticField(sopp.MagneticField, Optimizable):
         sopp.MagneticField.invalidate_cache(self)
 
     def recompute_bell(self, parent=None):
-        if np.any(self.dofs_free_status):
-            self.clear_cached_properties()
+        # Unconditional: ``dofs_free_status`` concatenates the free status of the whole dof
+        # lineage, which is very expensive when called once per dependent of every changed dof.
+        # ``clear_cached_properties`` only calls the cheap C++ ``invalidate_cache``.
+        self.clear_cached_properties()
 
     def __add__(self, other):
         """Add two magnetic fields."""

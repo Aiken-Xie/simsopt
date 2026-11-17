@@ -170,10 +170,11 @@ class DOFs(GSONable, Hashable):
         Updates the free DOF indices in the dependent Optimizable objects.
         This function is called whenever a DOF is fixed or set free.
         """
+        visited = set()
         for opt_ref in self._dep_opts:
             opt = opt_ref()
             if opt is not None:
-                opt.update_free_dof_size_indices()
+                opt.update_free_dof_size_indices(visited)
 
     def __len__(self):
         return len(self._free)
@@ -940,7 +941,7 @@ class Optimizable(ABC_Callable, Hashable, GSONable, metaclass=OptimizableMeta):
     def unique_dof_lineage(self):
         return self._unique_dof_opts
 
-    def update_free_dof_size_indices(self) -> None:
+    def update_free_dof_size_indices(self, _visited=None) -> None:
         """
         Updates the DOFs lengths for the Optimizable object as well as
         those of the descendent (dependent) Optimizable objects.
@@ -952,6 +953,15 @@ class Optimizable(ABC_Callable, Hashable, GSONable, metaclass=OptimizableMeta):
         # TODO: Develop a faster scheme.
         # TODO: Alternatively ask the user to call this manually from the end
         # TODO: node after fixing/unfixing any DOF
+        # The result for each object only depends on its ancestors' free status, which does not
+        # change during this call, so every object needs updating just once even when it is
+        # reachable through many paths. ``_visited`` (ids of already updated objects) stops shared
+        # descendants from being re-walked once per path, which is exponential in the graph depth.
+        if _visited is None:
+            _visited = set()
+        if id(self) in _visited:
+            return
+        _visited.add(id(self))
         dof_indices = [0]
         free_dof_size = 0
         dof_objs = set()
@@ -969,7 +979,7 @@ class Optimizable(ABC_Callable, Hashable, GSONable, metaclass=OptimizableMeta):
         for weakref_child in self._children:
             child = weakref_child()
             if child is not None:
-                child.update_free_dof_size_indices()
+                child.update_free_dof_size_indices(_visited)
 
     def _update_full_dof_size_indices(self) -> None:
         """

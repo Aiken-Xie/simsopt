@@ -903,6 +903,12 @@ class InterpolatedField(sopp.InterpolatedField, MagneticField):
         sopp.InterpolatedField.__init__(self, field, degree, rrange, phirange, zrange, extrapolate, nfp, stellsym, skip)
         self.__field = field
 
+    def recompute_bell(self, parent=None):
+        # The interpolant is built once from the wrapped field and has no dofs of its own, so it
+        # must never be invalidated (``MagneticField.recompute_bell`` now clears unconditionally).
+        if np.any(self.dofs_free_status):
+            self.clear_cached_properties()
+
     def to_vtk(self, filename):
         """Export the field evaluated on a regular grid for visualisation with e.g. Paraview."""
         degree = self.rule.degree
