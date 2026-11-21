@@ -1,3 +1,6 @@
+import warnings
+from math import gcd
+
 import numpy as np
 
 from jax import grad, vmap
@@ -10,6 +13,44 @@ from simsopt._core.derivative import derivative_dec
 from simsopt.objectives import forward_backward
 
 __all__ = ["OmnigenousField", "OmnigenousResidual", "OmnigenousSlopePenalty"]
+
+HELICITY_CONVENTIONS = ("per_period", "full_torus")
+
+
+def helicity_period_multiplier(nfp, helicity, helicity_convention="per_period"):
+    r"""
+    Return :math:`N_p`, the toroidal multiplier of the topology-adapted angles
+    :math:`\tilde\zeta = N_p (N\phi - M\theta)`.
+
+    * ``"per_period"``: :math:`N_p = n_{fp}`; a helicity :math:`(M, N)` field has :math:`|N|`
+      identical wells per field period.
+    * ``"full_torus"``: the full-torus mode numbers of Landreman & Catto, Phys. Plasmas 19,
+      056103 (2012), Sec. V. :math:`N_p = n_{fp}/|N|` (:math:`N_p = n_{fp}` for :math:`N = 0`),
+      :math:`N` must divide :math:`n_{fp}` and :math:`(M, N)` must be a primitive pair, so
+      quasi-helical symmetry is :math:`(1, n_{fp})` and there is one well per period.
+    """
+    if helicity_convention not in HELICITY_CONVENTIONS:
+        raise ValueError(f"helicity_convention must be one of {HELICITY_CONVENTIONS}, "
+                         f"got {helicity_convention!r}")
+    M, N = helicity
+    if helicity_convention == "per_period":
+        return nfp
+    if M == 0 and N == 0:
+        raise ValueError("helicity (M, N) cannot be (0, 0)")
+    if gcd(abs(M), abs(N)) != 1:
+        raise ValueError(f"helicity {helicity} must be a primitive integer pair")
+    if N == 0:
+        return nfp
+    nfp_int = int(nfp)
+    if nfp_int != nfp or nfp_int < 1:
+        raise ValueError(f"nfp must be a positive integer, got {nfp!r}")
+    if nfp_int % abs(N) != 0:
+        raise ValueError(
+            f"helicity N={N} must divide nfp={nfp} in the full_torus convention: a "
+            f"helicity (M, N) field has nfp/|N| toroidal periods per winding. A "
+            f"quasi-helically symmetric field on an nfp-period device is helicity (1, nfp).")
+    return nfp_int // abs(N)
+
 
 class OmnigenousField(Optimizable):
     @staticmethod
@@ -29,7 +70,8 @@ class OmnigenousField(Optimizable):
                 out += smodes[l, n] * _s_x_basis(x, l) * _s_y_basis(y, n)
         return out
 
-    def __init__(self, Bmax, Bmin, nfp, iota, Dparams=None, sparams=None, phi=128, theta=64, neta=181, helicity=(0, 1), dofs=None):
+    def __init__(self, Bmax, Bmin, nfp, iota, Dparams=None, sparams=None, phi=128, theta=64, neta=181, helicity=(0, 1), dofs=None,
+                 helicity_convention="per_period"):
         if not(Bmax > Bmin > 0):
             raise ValueError("Require Bmax > Bmin > 0")
 
@@ -74,12 +116,16 @@ class OmnigenousField(Optimizable):
         # Default helicity = (0, 1) for QI fields
         self._helicity = tuple(map(int, helicity))
         M, N = self._helicity
+        self._helicity_convention = helicity_convention
         if not N and abs(M) != 1:
             raise ValueError(f"helicity {self._helicity} is not supported: with N = 0 the angles "
                              "assume M = ±1. A nonzero N gives |N| identical wells per field "
                              "period.")
-        self.tilde_mat = np.array([[-M*nfp, N*nfp], [1, 0]]) if N else \
-                         np.array([[1, 0], [0, nfp]])
+        # Np = nfp (per_period) or nfp/|N| (full_torus, validated); zeta~ = Np*(N*phi - M*theta)
+        self._Np = helicity_period_multiplier(nfp, self._helicity, helicity_convention)
+        Np = self._Np
+        self.tilde_mat = np.array([[-M*Np, N*Np], [1, 0]]) if N else \
+                         np.array([[1, 0], [0, Np]])
 
         if isinstance(phi, (int, np.integer)):
             self._nphi = phi
@@ -170,6 +216,15 @@ class OmnigenousField(Optimizable):
     @property
     def helicity(self):
         return self._helicity
+
+    @property
+    def helicity_convention(self):
+        return self._helicity_convention
+
+    @property
+    def Np(self):
+        r"""Toroidal multiplier of the adapted angles, see `helicity_period_multiplier`."""
+        return self._Np
 
     @property
     def epsilon(self):
@@ -353,11 +408,11 @@ class OmnigenousField(Optimizable):
             self.get_tilde_coordinates(self._phi_grid, self._theta_grid)
 
         M, N = self.helicity
-        den = (N - self.iota*M)*self.nfp
+        den = (N - self.iota*M)*self.Np
         if not N:
             if np.isclose(self.iota, 0.):
                 raise ValueError(f"helicity {self.helicity} is degenerate at iota={self.iota}")
-            self._tilde_iota = self.nfp / self.iota
+            self._tilde_iota = self.Np / self.iota
         elif np.isclose(den, 0.):
             raise ValueError(f"helicity {self.helicity} is degenerate at iota={self.iota}")
         else:
@@ -466,7 +521,7 @@ class OmnigenousField(Optimizable):
         where iota changes over the optimization.
         """
         M, N = self.helicity
-        return -self.nfp/self.iota**2 if not N else N/((N - self.iota*M)**2 * self.nfp)
+        return -self.Np/self.iota**2 if not N else N/((N - self.iota*M)**2 * self.Np)
 
     def dmodB_by_diota(self):
         eta_grid = self.eta_grid
