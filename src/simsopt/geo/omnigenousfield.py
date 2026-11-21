@@ -9,7 +9,7 @@ from simsopt._core import Derivative, Optimizable
 from simsopt._core.derivative import derivative_dec
 from simsopt.objectives import forward_backward
 
-__all__ = ["OmnigenousField", "OmnigenousResidual"]
+__all__ = ["OmnigenousField", "OmnigenousResidual", "OmnigenousSlopePenalty"]
 
 class OmnigenousField(Optimizable):
     @staticmethod
@@ -74,6 +74,10 @@ class OmnigenousField(Optimizable):
         # Default helicity = (0, 1) for QI fields
         self._helicity = tuple(map(int, helicity))
         M, N = self._helicity
+        if not N and abs(M) != 1:
+            raise ValueError(f"helicity {self._helicity} is not supported: with N = 0 the angles "
+                             "assume M = ±1. A nonzero N gives |N| identical wells per field "
+                             "period.")
         self.tilde_mat = np.array([[-M*nfp, N*nfp], [1, 0]]) if N else \
                          np.array([[1, 0], [0, nfp]])
 
@@ -369,8 +373,62 @@ class OmnigenousField(Optimizable):
             )
         self.need_to_update = False
 
+    def _slope_args(self):
+        r"""
+        Arguments of D and s on the eta scan at each tilde theta of the grid, flattened.
+        """
+        self.update_coords()
+        eta = np.linspace(0, 2*np.pi, self.neta)[None, :]
+        tilde_theta = np.unique(self._tilde_theta_grid)[:, None]
+        sign = np.where(eta <= np.pi, 1.0, -1.0)
+        Darg = np.where(eta <= np.pi, eta, 2*np.pi - eta)
+        sargy = sign*tilde_theta + self._tilde_iota*self.Dfunc(Darg)
+        Darg, sargy = np.broadcast_arrays(Darg, sargy)
+        return Darg.ravel(), sargy.ravel()
+
     def dzeta_by_deta(self):
-        raise NotImplementedError("OmnigenousField.dzeta_by_deta is not implemented yet")
+        r"""
+        Slope of tilde phi with respect to eta, on an eta scan at each tilde theta of the grid.
+        The eta-to-tilde-phi map is invertible only while every slope remains positive.
+        """
+        x, y = self._slope_args()
+        slope = -(self.ds_by_dx(x, y) + (1 + self._tilde_iota*self.ds_by_dy(x, y))*self.dD_by_dx(x))
+        return slope
+
+    def dslope_by_dparams(self):
+        r"""
+        Derivative of `dzeta_by_deta` with respect to the dofs (Bmax, Bmin, Dparams, sparams),
+        shaped (number of slopes, number of dofs). Bmax and Bmin do not enter the slopes.
+        """
+        x, y = self._slope_args()
+        tilde_iota = self._tilde_iota
+        D_x = self.dD_by_dx(x)
+        D_p = self.dD_by_dDparams(x)
+        D_xp = np.asarray(self._d2D_by_dxdDparams(x, self.Dparams))
+        s_y = self.ds_by_dy(x, y)
+        s_xy = np.asarray(self._d2s_by_dxdy(x, y, self.sparams))
+        s_yy = np.asarray(self._d2s_by_dydy(x, y, self.sparams))
+        s_xp = np.asarray(self._d2s_by_dxdsparams(x, y, self.sparams)).reshape(x.size, -1)
+        s_yp = np.asarray(self._d2s_by_dydsparams(x, y, self.sparams)).reshape(x.size, -1)
+        dslope = np.zeros((x.size, self.ndofs))
+        dslope[:, 2:2+self.DN] = -(
+            tilde_iota*(s_xy + tilde_iota*s_yy*D_x)[:, None]*D_p
+            + (1 + tilde_iota*s_y)[:, None]*D_xp)
+        dslope[:, 2+self.DN:] = -(s_xp + tilde_iota*D_x[:, None]*s_yp)
+        return dslope
+
+    def dslope_by_diota(self):
+        r"""
+        Derivative of `dzeta_by_deta` with respect to iota.
+        """
+        x, y = self._slope_args()
+        tilde_iota = self._tilde_iota
+        D = np.asarray(self.Dfunc(x))
+        s_y = self.ds_by_dy(x, y)
+        s_xy = np.asarray(self._d2s_by_dxdy(x, y, self.sparams))
+        s_yy = np.asarray(self._d2s_by_dydy(x, y, self.sparams))
+        return (-(s_xy*D + (s_y + tilde_iota*s_yy*D)*self.dD_by_dx(x))
+                * self.dtilde_iota_by_diota())
 
     def dmodB_by_dparams(self):
         eta_grid = self.eta_grid
@@ -402,16 +460,22 @@ class OmnigenousField(Optimizable):
 
         return dBdp
 
+    def dtilde_iota_by_diota(self):
+        r"""
+        Derivative of tilde iota with respect to iota. Necessary for optimizing Boozer surfaces
+        where iota changes over the optimization.
+        """
+        M, N = self.helicity
+        return -self.nfp/self.iota**2 if not N else N/((N - self.iota*M)**2 * self.nfp)
+
     def dmodB_by_diota(self):
         eta_grid = self.eta_grid
         sign, Darg, _, sargy = self.get_args()
         D    = self.Dfunc(Darg)
         s_y  = self.ds_by_dy(Darg, sargy)
         den  = self.ds_by_dx(Darg, sargy) + (1 + s_y*self.tilde_iota)*self.dD_by_dx(Darg)
-        M, N = self.helicity
-        dtilde_by_diota = (
-            -self.nfp/self.iota**2 if not N else N/((N - self.iota*M)**2 * self.nfp))
-        return -self.Bmin*self.epsilon*np.sin(eta_grid) * (sign*s_y*D/den) * dtilde_by_diota
+        return -(self.Bmin*self.epsilon*np.sin(eta_grid) * (sign*s_y*D/den)
+                 * self.dtilde_iota_by_diota())
 
     def fit_to(self, coil_modB, **kwargs):
         from simsopt.util import proc0_print
@@ -452,6 +516,10 @@ class OmnigenousField(Optimizable):
             self.set_dofs(x)
             return self.dzeta_by_deta()
 
+        def slopes_jac(x):
+            self.set_dofs(x)
+            return self.dslope_by_dparams()
+
         x0 = self.get_dofs()
         slope_lb = kwargs.pop("slope_lb", 1e-2)
         if slopes(x0).min() <= slope_lb:
@@ -464,7 +532,7 @@ class OmnigenousField(Optimizable):
 
         if "maxiter" not in kwargs: kwargs["maxiter"] = 300
         if "ftol" not in kwargs: kwargs["ftol"] = 1e-12
-        slopes_constraint = NonlinearConstraint(slopes, slope_lb, np.inf)
+        slopes_constraint = NonlinearConstraint(slopes, slope_lb, np.inf, jac=slopes_jac)
         well_constraint = NonlinearConstraint(lambda x: np.array([x[0] - x[1], x[1]]), 1e-12, np.inf)
         bounds = [
             (1e-12, None), # Bmax
@@ -585,3 +653,63 @@ class OmnigenousResidual(Optimizable):
 
         self._dJ = dJ_by_coils + dJ_by_local_x
 
+class OmnigenousSlopePenalty(Optimizable):
+    r"""
+    Penalty that keeps the eta-to-tilde-phi map of an omnigenous target invertible,
+
+    .. math::
+        J = \frac{1}{N} \sum_k \max(0, \sigma_{\min} - \sigma_k)^2,
+
+    where :math:`\sigma_k` are the slopes from `OmnigenousField.dzeta_by_deta`. The target's
+    iota is the Boozer surface's, so the gradient reaches the coils through the Boozer solve.
+
+    Args:
+        boozersurface: Boozer surface that sets the target's iota.
+        target: OmnigenousField whose map is kept invertible.
+        slope_lb: Smallest allowed slope.
+    """
+
+    def __init__(self, boozersurface, target, slope_lb=0.1):
+        Optimizable.__init__(self, depends_on=[boozersurface, target])
+        self.boozersurface = boozersurface
+        self.target = target
+        self.slope_lb = slope_lb
+
+    def recompute_bell(self, parent=None):
+        self._J = None
+        self._dJ = None
+
+    def J(self):
+        if self._J is None:
+            self.compute_objective_and_derivatives()
+        return self._J
+
+    @derivative_dec
+    def dJ(self):
+        if self._dJ is None:
+            self.compute_objective_and_derivatives()
+        return self._dJ
+
+    def compute_objective_and_derivatives(self):
+        if self.boozersurface.need_to_run_code:
+            raise RuntimeError("Need to run boozer surface first")
+        iota = self.boozersurface.res["iota"]
+        G = self.boozersurface.res["G"]
+        self.target.set_iota(iota)
+
+        shortfall = np.maximum(0., self.slope_lb - self.target.dzeta_by_deta())
+        self._J = float(np.mean(shortfall**2))
+        if not shortfall.any():
+            self._dJ = Derivative()
+            return
+
+        dJ_by_dslope = -2*shortfall/shortfall.size
+        P, L, U = self.boozersurface.res["PLU"]
+        dJ_by_dsurf = np.zeros(L.shape[0])
+        dJ_by_dsurf[-2 if G is not None else -1] = dJ_by_dslope @ self.target.dslope_by_diota()
+        adj = forward_backward(P, L, U, dJ_by_dsurf)
+        adj_times_dg_dcoil = self.boozersurface.res["vjp"](adj, self.boozersurface, iota, G)
+
+        self._dJ = (
+            Derivative({self.target: dJ_by_dslope @ self.target.dslope_by_dparams()})
+            - adj_times_dg_dcoil) # pyright: ignore[reportOperatorIssue]

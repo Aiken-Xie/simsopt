@@ -1,6 +1,9 @@
+import jax.numpy as jnp
 import numpy as np
+from jax import grad
 
 import simsoptpp as sopp
+from .jit import jit
 from .._core.optimizable import Optimizable
 from .._core.derivative import Derivative, derivative_dec
 from .._core.types import RealArray
@@ -11,7 +14,7 @@ from ..objectives.utilities import forward_backward
 __all__ = ['Area', 'Volume', 'ToroidalFlux', 'PrincipalCurvature',
            'QfmResidual', 'boozer_surface_residual', 'Iotas',
            'MajorRadius', 'NonQuasiSymmetricRatio', 'BoozerResidual',
-           'AspectRatio']
+           'AspectRatio', 'SurfaceSurfaceDistance']
 
 
 class AspectRatio(Optimizable):
@@ -1250,3 +1253,112 @@ def boozer_surface_residual_dB(surface, iota, G, biotsavart, derivatives=0, weig
 
     if derivatives == 1:
         return rtil_flattened, drtil_dB_flattened, J, d2rtil_dsurfacedB, d2rtil_dsurfacedgradB
+
+
+def _surface_to_surface_distance_pure(gamma1, gamma2, mdist):
+    gamma1 = gamma1.reshape((-1, 3))
+    gamma2 = gamma2.reshape((-1, 3))
+    dists = jnp.sqrt(jnp.sum((gamma1[:, None, :] - gamma2[None, :, :])**2, axis=2))
+    return jnp.sum(jnp.maximum(mdist - dists, 0)**2) / (gamma1.shape[0] * gamma2.shape[0])
+
+
+def _surface_to_surface_signed_distances_pure(gamma1, gamma2, normal2):
+    """
+    Depth of each point of gamma1 inside the surface gamma2, measured along the outward
+    normal normal2 at the nearest point of gamma2. Points outside get negative depths.
+    """
+    gamma1 = gamma1.reshape((-1, 3))
+    gamma2 = gamma2.reshape((-1, 3))
+    normal2 = normal2.reshape((-1, 3))
+    dists2 = (jnp.sum(gamma1**2, axis=1)[:, None] + jnp.sum(gamma2**2, axis=1)[None, :]
+              - 2 * gamma1 @ gamma2.T)
+    nearest = jnp.argmin(dists2, axis=1)
+    unitnormal2 = normal2[nearest] / jnp.linalg.norm(normal2[nearest], axis=1)[:, None]
+    return jnp.sum((gamma2[nearest] - gamma1) * unitnormal2, axis=1)
+
+
+def _surface_to_surface_signed_distance_pure(gamma1, gamma2, normal2, mdist):
+    depths = _surface_to_surface_signed_distances_pure(gamma1, gamma2, normal2)
+    return jnp.mean(jnp.maximum(mdist - depths, 0)**2)
+
+
+class SurfaceSurfaceDistance(Optimizable):
+    r"""
+    Penalty on two surfaces coming closer than a minimum distance.
+
+    Unsigned (default), over every pair of points:
+
+    .. math::
+        J = \frac{1}{N_1 N_2} \sum_{i,j} \max(0, d_{\min} - \|\mathbf{s}_1^i - \mathbf{s}_2^j\|)^2
+
+    Signed, ``surf1`` must lie inside ``surf2`` by at least :math:`d_{\min}`:
+
+    .. math::
+        J = \frac{1}{N_1} \sum_i \max(0, d_{\min} - \delta_i)^2, \quad
+        \delta_i = (\mathbf{s}_2^{j(i)} - \mathbf{s}_1^i) \cdot \hat{\mathbf{n}}_2^{j(i)}
+
+    where :math:`j(i)` is the point of ``surf2`` nearest to :math:`\mathbf{s}_1^i` and
+    :math:`\hat{\mathbf{n}}_2` points out of ``surf2``. The depth :math:`\delta_i` is negative
+    outside ``surf2``, so the penalty keeps growing however far out a point goes.
+
+    Args:
+        surf1: Surface whose points are checked (the inner surface when signed).
+        surf2: Surface they are measured against (the outer surface when signed).
+        minimum_distance: Smallest allowed distance, or depth when signed.
+        signed: Use the signed (containment) penalty.
+    """
+
+    def __init__(self, surf1, surf2, minimum_distance, signed=False):
+        self.surf1 = surf1
+        self.surf2 = surf2
+        self.mdist = minimum_distance
+        self.signed = signed
+        # sum(x . n) is positive when the normal points out of the surface.
+        self.orientation = float(np.sign(np.sum(surf2.gamma() * surf2.normal())))
+        self.depths_jax = jit(_surface_to_surface_signed_distances_pure)
+        if signed:
+            self.J_jax = jit(lambda g1, g2, n2: _surface_to_surface_signed_distance_pure(
+                g1, g2, n2, minimum_distance))
+            self.dJ_jax = jit(grad(self.J_jax, argnums=(0, 1, 2)))
+        else:
+            self.J_jax = jit(lambda g1, g2: _surface_to_surface_distance_pure(
+                g1, g2, minimum_distance))
+            self.dJ_jax = jit(grad(self.J_jax, argnums=(0, 1)))
+        super().__init__(depends_on=[surf1, surf2])
+
+    def outward_normal2(self):
+        """
+        Normal of ``surf2``, oriented out of the surface.
+        """
+        return self.orientation * self.surf2.normal()
+
+    def signed_distances(self):
+        """
+        Depth of each ``surf1`` point inside ``surf2``; negative outside.
+        """
+        return np.asarray(self.depths_jax(
+            self.surf1.gamma(), self.surf2.gamma(), self.outward_normal2()))
+
+    def J(self):
+        if self.signed:
+            return float(self.J_jax(
+                self.surf1.gamma(), self.surf2.gamma(), self.outward_normal2()))
+        return float(self.J_jax(self.surf1.gamma(), self.surf2.gamma()))
+
+    @derivative_dec
+    def dJ(self):
+        if self.signed:
+            dgamma1, dgamma2, dnormal2 = self.dJ_jax(
+                self.surf1.gamma(), self.surf2.gamma(), self.outward_normal2())
+            dsurf2 = (self.surf2.dgamma_by_dcoeff_vjp(np.asarray(dgamma2))
+                      + self.surf2.dnormal_by_dcoeff_vjp(
+                          self.orientation * np.asarray(dnormal2)))
+        else:
+            dgamma1, dgamma2 = self.dJ_jax(self.surf1.gamma(), self.surf2.gamma())
+            dsurf2 = self.surf2.dgamma_by_dcoeff_vjp(np.asarray(dgamma2))
+        return Derivative({
+            self.surf1: self.surf1.dgamma_by_dcoeff_vjp(np.asarray(dgamma1)),
+            self.surf2: dsurf2,
+        })
+
+    return_fn_map = {'J': J, 'dJ': dJ}
