@@ -643,6 +643,9 @@ class OmnigenousResidual(Optimizable):
     def fit_target_field(self, **kwargs):
         if self.boozersurface.need_to_run_code:
             raise RuntimeError("Need to run boozer surface first")
+        if hasattr(self.target, "lock_iota_reference"):
+            # piecewise target: its branch and geometry are tied to the surface's iota
+            self.target.set_iota(self.boozersurface.res["iota"])
         self.boozersurface.biotsavart.set_points(
             self.boozersurface.surface.gamma().reshape(-1, 3))
         modB = np.linalg.norm(self.boozersurface.biotsavart.B().reshape(

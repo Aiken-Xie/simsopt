@@ -32,6 +32,7 @@ from .wireframe_toroidal import *
 from .ports import *
 
 from .omnigenousfield import *
+from .piecewiseomnigenousfield import *
 
 from .permanent_magnet_grid import *
 
@@ -51,4 +52,4 @@ __all__ = (curve.__all__ + curvehelical.__all__ +
            permanent_magnet_grid.__all__ + qi_field_generator.__all__ +
            curveplanarellipticalcylindrical.__all__ +
            curvesuperellipse.__all__ + curveplanaronsurface.__all__ +
-           omnigenousfield.__all__)
+           omnigenousfield.__all__ + piecewiseomnigenousfield.__all__)
