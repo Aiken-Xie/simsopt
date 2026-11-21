@@ -53,6 +53,16 @@ def helicity_period_multiplier(nfp, helicity, helicity_convention="per_period"):
 
 
 class OmnigenousField(Optimizable):
+    r"""
+    Omnigenous target field :math:`|B|(\phi, \theta)` with a frozen phase offset.
+
+    The target is evaluated at the shifted angles :math:`(\phi - \zeta_c, \theta - \theta_c)`: the
+    topology-adapted angles are computed from the shifted angles, so the target maximum
+    (:math:`\tilde\zeta = 0`, :math:`B_{max}`) sits at :math:`(\zeta_c, \theta_c)` instead of the
+    origin. ``zeta_c`` and ``theta_c`` are not dofs; they are set once (constructor, `set_center`
+    or `fit_to`) and frozen, like the centres of `PiecewiseOmnigenousField`. The default (0, 0)
+    reproduces the unshifted field exactly. They are saved and loaded with the object.
+    """
     @staticmethod
     def Dfunc_pure(x, Dmodes): # Dmodes is shape (DN,)
         first_term = jnp.pi - x
@@ -71,7 +81,7 @@ class OmnigenousField(Optimizable):
         return out
 
     def __init__(self, Bmax, Bmin, nfp, iota, Dparams=None, sparams=None, phi=128, theta=64, neta=181, helicity=(0, 1), dofs=None,
-                 helicity_convention="per_period"):
+                 helicity_convention="per_period", zeta_c=0.0, theta_c=0.0):
         # When loading (dofs given) the Bmax, Bmin arguments are ignored and the dofs are checked
         # below, where the tiny non-positive wells written by older fits are repaired.
         if dofs is None and not (Bmax > Bmin > 0):
@@ -79,6 +89,8 @@ class OmnigenousField(Optimizable):
 
         self._nfp = nfp
         self._iota = iota
+        self._zeta_c = float(zeta_c)
+        self._theta_c = float(theta_c)
 
         Dparams = np.zeros(3) if (Dparams is None) else np.asarray(Dparams, dtype=float)
         sparams = np.zeros((3, 3)) if (sparams is None) else np.asarray(sparams, dtype=float)
@@ -225,6 +237,16 @@ class OmnigenousField(Optimizable):
         return self._helicity_convention
 
     @property
+    def zeta_c(self):
+        """Toroidal offset of the target (frozen, not a dof)."""
+        return self._zeta_c
+
+    @property
+    def theta_c(self):
+        """Poloidal offset of the target (frozen, not a dof)."""
+        return self._theta_c
+
+    @property
     def Np(self):
         r"""Toroidal multiplier of the adapted angles, see `helicity_period_multiplier`."""
         return self._Np
@@ -349,6 +371,41 @@ class OmnigenousField(Optimizable):
         self._iota = iota
         self.need_to_update = True
 
+    def set_center(self, zeta_c, theta_c):
+        """Set the frozen phase offset (zeta_c, theta_c) of the target."""
+        zeta_c, theta_c = float(zeta_c), float(theta_c)
+        if zeta_c == self._zeta_c and theta_c == self._theta_c:
+            return
+        self._zeta_c = zeta_c
+        self._theta_c = theta_c
+        self.need_to_update = True
+
+    def center_from_modB(self, coil_modB):
+        r"""
+        Offset (zeta_c, theta_c) that puts the target maximum at the maximum of ``coil_modB``
+        (shape (nphi, ntheta) of this field's grid), by helicity (M, N):
+
+        * N = 0 (e.g. (1, 0), B varies with theta, quasi-axisymmetric): theta_c = theta of the
+          maximum, zeta_c = 0.
+        * M = 0 (e.g. (0, 1), B varies with phi, quasi-isodynamic): zeta_c = phi of the maximum
+          (mod one field period), theta_c = 0.
+        * M, N both nonzero (helical): only :math:`N\phi - M\theta` sets the phase; both are
+          taken at the maximum, so the maximum maps to :math:`\tilde\zeta = 0` with the
+          label angle also zero there.
+
+        The offset of the angle that only labels the field line is left at zero.
+        """
+        coil_modB = np.asarray(coil_modB)
+        i, j = np.unravel_index(np.argmax(coil_modB), coil_modB.shape)
+        phi_max = float(np.mod(self._phi[i], 2*np.pi/self._nfp))
+        theta_max = float(np.mod(self._theta[j], 2*np.pi))
+        M, N = self._helicity
+        if not N:
+            return 0.0, theta_max
+        if not M:
+            return phi_max, 0.0
+        return phi_max, theta_max
+
     def set_neta(self, neta):
         self._neta = neta
         self.need_to_update = True
@@ -370,6 +427,8 @@ class OmnigenousField(Optimizable):
 
     def get_tilde_coordinates(self, phi, theta):
         (a, b), (c, d) = self.tilde_mat
+        theta = theta - self._theta_c
+        phi = phi - self._zeta_c
         return a*theta + b*phi, c*theta + d*phi
 
     def get_phi_tilde_from_eta(self, eta, tilde_theta):
@@ -555,8 +614,27 @@ class OmnigenousField(Optimizable):
         return -(self.Bmin*self.epsilon*np.sin(eta_grid) * (sign*s_y*D/den)
                  * self.dtilde_iota_by_diota())
 
-    def fit_to(self, coil_modB, **kwargs):
+    def fit_to(self, coil_modB, center="auto", **kwargs):
+        r"""
+        Fit the target to ``coil_modB`` (shape (nphi, ntheta)).
+
+        Args:
+            center: how the frozen phase offset is set before fitting.
+                ``"auto"`` (default): put the target maximum at the maximum of ``coil_modB``,
+                see `center_from_modB` (N = 0: theta_c from the argmax, zeta_c = 0; M = 0: zeta_c
+                from the argmax, theta_c = 0; helical: both from the argmax). A pure QA field with
+                its maximum at theta = pi thus gets theta_c = pi. ``"none"``: keep the current
+                offset. ``(zeta_c, theta_c)``: use this offset. The offset is not fitted.
+            well_margin, slope_lb, maxiter, ftol: see the body; other kwargs go to SLSQP.
+        """
         from simsopt.util import proc0_print
+        if isinstance(center, str):
+            if center == "auto":
+                self.set_center(*self.center_from_modB(coil_modB))
+            elif center != "none":
+                raise ValueError("center must be 'auto', 'none' or (zeta_c, theta_c)")
+        else:
+            self.set_center(*center)
         self.set_Bmax(float(coil_modB.max()))
         self.set_Bmin(float(coil_modB.min()))
         # Keep a well of at least `well_margin`*mean|B| so the fit cannot collapse to a flat target.
