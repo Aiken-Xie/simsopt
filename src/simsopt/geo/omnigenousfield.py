@@ -72,7 +72,9 @@ class OmnigenousField(Optimizable):
 
     def __init__(self, Bmax, Bmin, nfp, iota, Dparams=None, sparams=None, phi=128, theta=64, neta=181, helicity=(0, 1), dofs=None,
                  helicity_convention="per_period"):
-        if not(Bmax > Bmin > 0):
+        # When loading (dofs given) the Bmax, Bmin arguments are ignored and the dofs are checked
+        # below, where the tiny non-positive wells written by older fits are repaired.
+        if dofs is None and not (Bmax > Bmin > 0):
             raise ValueError("Require Bmax > Bmin > 0")
 
         self._nfp = nfp
@@ -112,6 +114,7 @@ class OmnigenousField(Optimizable):
             Optimizable.__init__(self, x0=x0, names=self.local_full_dof_names)
         else:
             Optimizable.__init__(self, dofs=dofs)
+            self._repair_loaded_well()
 
         # Default helicity = (0, 1) for QI fields
         self._helicity = tuple(map(int, helicity))
@@ -301,6 +304,26 @@ class OmnigenousField(Optimizable):
         if self.need_to_update:
             self.update()
         return self._eta_grid
+
+    # Smallest well Bmax - Bmin written back when a saved target has a numerically flat or slightly
+    # negative one (the old `fit_to` could end at +-1e-12 because SLSQP violated its own bound).
+    _min_well = 1e-12
+    _well_repair_rtol = 1e-6
+
+    def _repair_loaded_well(self):
+        x = np.array(self.local_full_x, dtype=float)
+        Bmax, Bmin = x[0], x[1]
+        if not (np.isfinite(Bmax) and np.isfinite(Bmin) and Bmin > 0):
+            raise ValueError("Require Bmax > Bmin > 0")
+        if Bmax - Bmin >= self._min_well:
+            return
+        if Bmax - Bmin < -self._well_repair_rtol*Bmin:
+            raise ValueError("Require Bmax > Bmin > 0")
+        warnings.warn(
+            f"Loaded OmnigenousField has Bmax - Bmin = {Bmax - Bmin:.3e} (a flat target left by "
+            f"an old fit_to); clamping Bmax to Bmin + {self._min_well:.0e}.", stacklevel=3)
+        x[0] = Bmin + self._min_well
+        self.local_full_x = x
 
     def set_dofs(self, new_values):
         if np.array_equal(np.array(self.local_full_x, dtype=float), np.array(new_values, dtype=float)):
@@ -536,6 +559,11 @@ class OmnigenousField(Optimizable):
         from simsopt.util import proc0_print
         self.set_Bmax(float(coil_modB.max()))
         self.set_Bmin(float(coil_modB.min()))
+        # Keep a well of at least `well_margin`*mean|B| so the fit cannot collapse to a flat target.
+        well_margin = kwargs.pop("well_margin", 1e-3)
+        margin = max(well_margin*float(np.mean(np.abs(coil_modB))), self._min_well)
+        if self.Bmax - self.Bmin < margin:  # nearly flat input: start from a non-flat target
+            self.set_Bmax(self.Bmin + 2*margin)
         rms_modB = np.sqrt(np.mean(coil_modB**2))
 
         cache = dict(x=None, r=None, J=None)
@@ -588,7 +616,7 @@ class OmnigenousField(Optimizable):
         if "maxiter" not in kwargs: kwargs["maxiter"] = 300
         if "ftol" not in kwargs: kwargs["ftol"] = 1e-12
         slopes_constraint = NonlinearConstraint(slopes, slope_lb, np.inf, jac=slopes_jac)
-        well_constraint = NonlinearConstraint(lambda x: np.array([x[0] - x[1], x[1]]), 1e-12, np.inf)
+        well_constraint = NonlinearConstraint(lambda x: np.array([x[0] - x[1], x[1]]), [margin, 1e-12], np.inf)
         bounds = [
             (1e-12, None), # Bmax
             (1e-12, None), # Bmin
@@ -603,7 +631,11 @@ class OmnigenousField(Optimizable):
             options=kwargs, # pyright: ignore[reportArgumentType]
         )
         self.fit_res = res
-        self.set_dofs(res.x)
+        xf = np.array(res.x, dtype=float)
+        if xf[0] - xf[1] < margin:  # SLSQP may violate its own constraint slightly
+            xf[0] = xf[1] + margin
+        res.x = xf
+        self.set_dofs(xf)
         proc0_print(
             f"fit_to: nfev={tracker['nfev']}, "
             f"min_slope={slopes(res.x).min():.4e} success={res.success}"

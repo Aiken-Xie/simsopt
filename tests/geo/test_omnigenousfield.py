@@ -152,5 +152,71 @@ class TestHelicityConvention(unittest.TestCase):
         self.assertTrue(np.array_equal(f.modB, g.modB))
 
 
+class TestFitToWellMargin(unittest.TestCase):
+    def _flat_ish_field(self):
+        # B varies only weakly and not along the (1, 0) helicity angle, so the fit wants a flat well
+        phi = np.linspace(0, 2*np.pi/2, 12, endpoint=False)
+        theta = np.linspace(0, 2*np.pi, 12, endpoint=False)
+        P, T = np.meshgrid(phi, theta, indexing="ij")
+        return phi, theta, 1.0 + 0.05*np.cos(T) + 0.01*np.sin(2*T + P)
+
+    def test_fit_keeps_well_margin(self):
+        import contextlib, io
+        phi, theta, B = self._flat_ish_field()
+        f = OmnigenousField(B.max(), B.min(), 2, 0.4, phi=phi, theta=theta, helicity=(1, 0))
+        with contextlib.redirect_stdout(io.StringIO()):
+            f.fit_to(B, slope_lb=0.1)
+        self.assertGreaterEqual(f.Bmax - f.Bmin, 1e-3*np.mean(B)*(1 - 1e-9))
+
+    def test_fit_starts_non_flat_from_flat_input(self):
+        import contextlib, io
+        phi, theta, _ = self._flat_ish_field()
+        B = np.ones((phi.size, theta.size))
+        f = OmnigenousField(1.0 + 1e-3, 1.0, 2, 0.4, phi=phi, theta=theta, helicity=(1, 0))
+        with contextlib.redirect_stdout(io.StringIO()):
+            f.fit_to(B, slope_lb=0.1)
+        self.assertGreater(f.Bmax - f.Bmin, 0.0)
+
+    def test_load_clamps_old_flat_well(self):
+        import json
+        import warnings
+        from simsopt import load, save
+        phi, theta, B = self._flat_ish_field()
+        f = OmnigenousField(1.2, 1.0, 2, 0.4, phi=phi, theta=theta, helicity=(1, 0))
+        for gap in (-6e-13, 9e-13):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "t.json")
+                save(f, path)
+                data = json.load(open(path))
+                for obj in data["simsopt_objs"].values():
+                    if obj.get("@class") == "DOFs":
+                        obj["x"]["data"][0] = obj["x"]["data"][1] + gap
+                    if obj.get("@class") == "OmnigenousField":
+                        obj["Bmax"] = obj["Bmin"] + gap
+                json.dump(data, open(path, "w"))
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    g = load(path)
+                self.assertTrue(any("clamping" in str(x.message) for x in w))
+                self.assertGreater(g.Bmax, g.Bmin)
+                self.assertTrue(np.all(np.isfinite(g.modB)))
+
+    def test_load_rejects_genuinely_inverted_well(self):
+        import json
+        from simsopt import load, save
+        phi, theta, _ = self._flat_ish_field()
+        f = OmnigenousField(1.2, 1.0, 2, 0.4, phi=phi, theta=theta, helicity=(1, 0))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.json")
+            save(f, path)
+            data = json.load(open(path))
+            for obj in data["simsopt_objs"].values():
+                if obj.get("@class") == "DOFs":
+                    obj["x"]["data"][0] = 0.5
+            json.dump(data, open(path, "w"))
+            with self.assertRaises(ValueError):
+                load(path)
+
+
 if __name__ == "__main__":
     unittest.main()
